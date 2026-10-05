@@ -1,4 +1,6 @@
 #!/bin/sh
-# Last line of defence: re-scan every tracked file before anything leaves the machine.
+# Last line of defence: scan exactly what is about to leave the machine — every added line
+# of every new commit (even if a later commit deletes it), commit messages, and
+# author/committer identities. Git passes the refs being pushed on stdin.
 root=$(git rev-parse --show-toplevel)
-exec uv run --quiet --project "$root" python "$root/scripts/check_identifiers.py" --all
+exec uv run --quiet --project "$root" python "$root/scripts/check_identifiers.py" --push

@@ -79,7 +79,11 @@ environment. **They never belong in this repository.** Every value under `exampl
 - Enable the hooks once per clone: `git config core.hooksPath .githooks`
   - `pre-commit` runs `scripts/check_identifiers.py --staged` plus `gitleaks` on staged changes
   - `commit-msg` scans the commit message
-  - `pre-push` rescans every tracked file
+  - `pre-push` scans exactly what is being pushed: every line added by every new commit
+    (even if a later commit deletes it), commit messages, and author/committer identities
+- Commit author and committer emails must match `git config identifiers.allowedEmail`
+  (a regex; default GitHub noreply addresses). Your global git email and its domain are
+  treated as private terms, so a work address can't leak through content or metadata.
 - `check_identifiers.py` builds its denylist **at run time** from your own `~/.aws/config`
   and kubeconfig (account IDs, SSO role/session names, hyphenated profile names, cluster and
   context names, endpoint IDs). The list is never written to the repo. Add extra private

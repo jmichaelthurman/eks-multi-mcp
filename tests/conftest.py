@@ -56,6 +56,8 @@ def isolated_aws(tmp_path, monkeypatch):
     monkeypatch.setenv("KUBECONFIG", str(tmp_path / "no-kubeconfig"))
     monkeypatch.setenv("EKS_MULTI_MCP_DENYLIST", str(tmp_path / "no-denylist"))
     monkeypatch.setenv("EKS_MULTI_MCP_CONFIG", str(tmp_path / "no-config"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no-aws-config"))
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-credentials"))
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")

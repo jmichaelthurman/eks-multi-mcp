@@ -1,0 +1,4 @@
+#!/bin/sh
+# Last line of defence: re-scan every tracked file before anything leaves the machine.
+root=$(git rev-parse --show-toplevel)
+exec uv run --quiet --project "$root" python "$root/scripts/check_identifiers.py" --all

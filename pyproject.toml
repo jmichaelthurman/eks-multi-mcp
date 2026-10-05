@@ -1,0 +1,35 @@
+[project]
+name = "eks-multi-mcp"
+version = "0.1.0"
+description = "Multi-account, multi-cluster Amazon EKS MCP server driven by ~/.aws/config, kubeconfig, and/or an explicit cluster map"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=2.3,<3",
+  "boto3>=1.35",
+  "kubernetes>=31.0",
+  "pyyaml>=6.0",
+]
+
+[project.scripts]
+eks-multi-mcp = "eks_multi_mcp.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eks_multi_mcp"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.urls]
+Repository = "https://github.com/jmichaelthurman/eks-multi-mcp"

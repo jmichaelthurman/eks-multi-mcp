@@ -1,0 +1,58 @@
+# eks-multi-mcp settings. Copy to ~/.config/eks-multi-mcp/config.yaml (or pass --config).
+# Keep your real file OUTSIDE this repository: account IDs, profile names and cluster names
+# describe your environment and must not be published. Every value below is a placeholder.
+#
+# Every key is optional: with no file the server discovers clusters from kubeconfig and
+# ~/.aws/config and runs read-only.
+
+# kubeconfig: ~/.kube/config         # string, list, or false to disable (default: $KUBECONFIG)
+# aws_config: ~/.aws/config
+
+discovery:
+  aws: false                          # true = eks:ListClusters in every account at startup
+  regions: [us-east-1]                # regions for discovery (default: each profile's region)
+  exclude_contexts: ["kind-*", "scratch-*"]
+
+profiles:
+  # When an account has several profiles, reads use the first whose SSO role / role_arn
+  # matches read_role_patterns and writes the first matching write_role_patterns.
+  # Ties go to the profile kubeconfig already uses for that cluster.
+  read_role_patterns: [ReadOnly, ViewOnly]
+  write_role_patterns: [Admin, PowerUser]
+  exclude: [dev-legacy]               # duplicate/alias profiles to ignore
+
+safety:
+  allow_write: false                  # same as --allow-write
+  allow_sensitive_data_access: false  # pod/CloudWatch logs, unredacted Secrets
+  protected_envs: [prod]              # writes here need confirm_cluster=<cluster name>
+
+# Per-account defaults. Keys are account IDs (quote them).
+accounts:
+  "111111111111": { name: dev, env: dev }
+  "222222222222": { name: stg, env: stg }
+  "333333333333": { name: prod, env: prod, read_profile: prod, write_profile: prod-admin }
+  "444444444444": { name: shared, env: shared }
+  "555555555555": { name: sandbox, env: sbx, read_only: true }
+
+# Explicit account/cluster map. Entries merge with kubeconfig contexts for the same cluster
+# (map wins) or add clusters that have no kube context at all.
+clusters:
+  - alias: prod-blue
+    cluster_name: web-prod-use1-blue
+    account_id: "333333333333"
+    region: us-east-1
+    aliases: [prod, web-prod]
+    tags: { color: blue, tier: web }
+
+  - alias: batch-eu
+    cluster_name: batch-euw1
+    region: eu-west-1
+    read_profile: shared             # account resolved from the profile
+    read_only: true                  # never writable, even with --allow-write
+
+  - alias: partner
+    cluster_name: partner-use1
+    account_id: "666666666666"
+    region: us-east-1
+    read_profile: shared
+    role_arn: arn:aws:iam::666666666666:role/EksReadOnly   # assumed on top of the profile

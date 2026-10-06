@@ -10,4 +10,5 @@ dist/
 .eks-multi-mcp.yaml
 denylist.txt
 kubeconfig*
+!/src/eks_multi_mcp/kubeconfig.py
 .env

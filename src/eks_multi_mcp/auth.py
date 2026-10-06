@@ -9,6 +9,7 @@ wrong account.
 from __future__ import annotations
 
 import base64
+import copy
 import os
 import stat
 import tempfile
@@ -122,16 +123,17 @@ class AuthManager:
         return {"account": ident["Account"], "arn": ident["Arn"]}
 
     def describe_cluster(self, target: Target, refresh: bool = False) -> dict:
+        """Cached eks:DescribeCluster. Returns a copy so callers can't corrupt the cache."""
         with self._lock:
             if not refresh and target.key in self._clusters:
-                return self._clusters[target.key]
+                return copy.deepcopy(self._clusters[target.key])
         try:
             c = self.aws(target, "eks").describe_cluster(name=target.cluster_name)["cluster"]
         except (BotoCoreError, ClientError) as e:
             raise CredentialError(explain_aws_error(e, target.read_profile)) from e
         with self._lock:
             self._clusters[target.key] = c
-        return c
+        return copy.deepcopy(c)
 
     # ------------------------------------------------------------- EKS token
     def eks_token(self, target: Target, mode: str = "read") -> str:

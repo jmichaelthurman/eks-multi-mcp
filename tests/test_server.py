@@ -69,3 +69,21 @@ def test_eks_token_shape(files, monkeypatch):
     assert url.netloc == "sts.us-east-1.amazonaws.com"
     assert q["Action"] == ["GetCallerIdentity"]
     assert "x-k8s-aws-id" in q["X-Amz-SignedHeaders"][0]
+
+
+def test_describe_cluster_tool_does_not_corrupt_cache(files, monkeypatch):
+    """Regression: the tool dropped certificateAuthority from the cached dict, so the next
+    Kubernetes client built for that cluster (e.g. the write client) died with KeyError."""
+    srv = server(files)
+    live = {"name": "web-dev-blue", "endpoint": "https://example", "status": "ACTIVE",
+            "certificateAuthority": {"data": "Q0E="}}
+
+    class FakeEks:
+        def describe_cluster(self, name):
+            return {"cluster": dict(live)}
+
+    monkeypatch.setattr(srv.auth, "aws", lambda *a, **k: FakeEks())
+    res = call(srv, "describe_cluster", target="dev")
+    assert "certificateAuthority" not in res.content[0].text
+    t = srv.registry.resolve("dev")
+    assert srv.auth.describe_cluster(t)["certificateAuthority"]["data"] == "Q0E="

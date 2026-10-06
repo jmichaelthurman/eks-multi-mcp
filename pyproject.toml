@@ -15,7 +15,11 @@ dependencies = [
 eks-multi-mcp = "eks_multi_mcp.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.6",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -30,6 +34,7 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["live: talks to real clusters; runs only when EKS_MULTI_MCP_LIVE_TARGET is set"]
 
 [project.urls]
 Repository = "https://github.com/jmichaelthurman/eks-multi-mcp"

@@ -153,7 +153,21 @@ profile needs it instead of failing with a generic credentials error.
 ## Development
 
 ```bash
-uv run --group dev pytest -q
+uv run --group dev pytest -q --cov=eks_multi_mcp     # offline; never touches AWS or your config
 uv run --group dev ruff check src tests scripts
 uv run python scripts/check_identifiers.py --all
+```
+
+The offline suite replaces boto3 and the Kubernetes client with in-memory doubles
+(`tests/fakes.py`) and hides `$HOME`, `~/.aws` and `$KUBECONFIG`, so it runs anywhere.
+
+`tests/test_live.py` is an opt-in end-to-end run against real clusters with your own
+config and SSO sessions. Every write in it is a server-side dry run followed by a read
+proving nothing persisted. The protected target only receives calls the gate must refuse
+before any request is sent.
+
+```bash
+EKS_MULTI_MCP_LIVE_TARGET=<non-prod target> \
+EKS_MULTI_MCP_LIVE_PROTECTED_TARGET=<prod target> \
+uv run --group dev pytest -m live -v
 ```

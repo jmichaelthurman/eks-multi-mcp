@@ -48,8 +48,12 @@ def _ctx(name, account, cluster, exec_cluster=None, profile=None, region="us-eas
 
 
 @pytest.fixture(autouse=True)
-def isolated_aws(tmp_path, monkeypatch):
-    """Tests must never reach a real account: hide the developer's AWS config and credentials."""
+def isolated_aws(request, tmp_path, monkeypatch):
+    """Tests must never reach a real account: hide the developer's AWS config and credentials,
+    and their home directory (which holds the real cluster map). Opt-in `live` tests are exempt."""
+    if request.node.get_closest_marker("live"):
+        return
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     for var in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
                 "AWS_SESSION_TOKEN"):
         monkeypatch.delenv(var, raising=False)

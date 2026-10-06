@@ -36,12 +36,6 @@ def test_writes_blocked_when_read_only(files):
         call(server(files), "apply_yaml", target="dev", yaml_content="kind: x")
 
 
-def test_protected_env_requires_confirm(files):
-    srv = server(files, safety={"allow_write": True})
-    with pytest.raises(Exception, match="confirm_cluster='web-prod-blue'"):
-        call(srv, "manage_k8s_resource", target="prod-blue", operation="delete", kind="Pod", name="x")
-
-
 def test_cluster_map_read_only_beats_allow_write(files):
     srv = server(files, safety={"allow_write": True},
                  clusters=[{"cluster_name": "web-dev-blue", "region": "us-east-1",

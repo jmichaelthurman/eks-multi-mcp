@@ -1,9 +1,11 @@
-"""apply_yaml and manage_k8s_resource: gates, what reaches the API server, and response shape."""
+"""apply_yaml and manage_k8s_resource: gates, human approval, what reaches the API server,
+and response shape."""
 
 import pytest
-from fakes import FakeDynamic, FakeResource, install_dynamic, make_server, result, tool_error
+from fakes import Approver, FakeDynamic, FakeResource, install_dynamic, make_server, result, tool_error
 
 CM = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm", "namespace": "app"}, "data": {"k": "v"}}
+DELETE_CM = {"operation": "delete", "kind": "ConfigMap", "name": "cm", "namespace": "app"}
 
 
 @pytest.fixture
@@ -16,49 +18,163 @@ def writable(files, monkeypatch):
     return srv, dyn, cm, ns, modes
 
 
+def assert_write_profile_only_after_approval(modes):
+    """Validation may use the read client; the write client is built only after approval."""
+    assert "write" in modes
+    first_write = modes.index("write")
+    assert all(m == "read" for m in modes[:first_write])
+    assert all(m == "write" for m in modes[first_write:])
+
+
 # ------------------------------------------------------------------ gates
 @pytest.mark.parametrize("tool,args", [
     ("apply_yaml", {"yaml_content": "kind: x"}),
-    ("manage_k8s_resource", {"operation": "delete", "kind": "ConfigMap", "name": "cm", "namespace": "app"}),
+    ("manage_k8s_resource", DELETE_CM),
 ])
 def test_write_tools_refuse_without_allow_write(files, monkeypatch, tool, args):
     srv = make_server(files)
-    dyn = FakeDynamic(FakeResource("ConfigMap"))
-    modes = install_dynamic(monkeypatch, srv, dyn)
-    assert "read-only" in tool_error(srv, tool, target="dev", **args)
-    assert modes == []  # refused before any client was built
+    modes = install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
+    human = Approver()
+    assert "read-only" in tool_error(srv, tool, human, target="dev", **args)
+    assert modes == [] and human.prompts == []  # refused before any client or prompt
 
 
-@pytest.mark.parametrize("confirm", [None, "prod-blue", "web-prod-blue ", "WEB-PROD-BLUE"])
-def test_protected_env_refuses_anything_but_the_exact_cluster_name(writable, confirm):
-    srv, _, cm, _, modes = writable
-    msg = tool_error(srv, "manage_k8s_resource", target="prod-blue", operation="delete", kind="ConfigMap",
-                     name="cm", namespace="app", dry_run=True, confirm_cluster=confirm)
-    assert "confirm_cluster='web-prod-blue'" in msg
-    assert modes == [] and cm.calls == []
-
-
-def test_protected_env_proceeds_with_exact_confirm(writable):
+def test_agent_supplied_confirmation_cannot_replace_the_human(writable):
+    """The old confirm_cluster argument is gone: passing it changes nothing, the human is still
+    asked, and their refusal stands."""
     srv, _, cm, _, _ = writable
-    out = result(srv, "manage_k8s_resource", target="prod-blue", operation="delete", kind="ConfigMap",
-                 name="cm", namespace="app", dry_run=True, confirm_cluster="web-prod-blue")
-    assert out["_target"]["cluster"] == "web-prod-blue"
+    human = Approver("decline")
+    msg = tool_error(srv, "manage_k8s_resource", human, target="prod-blue", confirm_cluster="web-prod-blue",
+                     **DELETE_CM)
+    assert "not approved" in msg and len(human.prompts) == 1 and cm.calls == []
+
+
+# ------------------------------------------------------------------ human approval
+@pytest.mark.parametrize("target", ["dev", "prod-blue"])
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_client_without_prompt_support_cannot_write(writable, target, dry_run):
+    srv, _, cm, _, modes = writable
+    msg = tool_error(srv, "manage_k8s_resource", None, target=target, dry_run=dry_run, **DELETE_CM)
+    assert "cannot show an approval prompt" in msg and "nothing was sent" in msg
+    assert cm.calls == [] and "write" not in modes
+
+
+@pytest.mark.parametrize("reply,expect", [
+    ("decline", "not approved (decline)"),
+    ("cancel", "not approved (cancel)"),
+    ({"approve": False}, "not approved"),
+    ({"something": "else"}, "malformed"),
+])
+def test_unprotected_write_needs_explicit_yes(writable, reply, expect):
+    srv, _, cm, _, modes = writable
+    human = Approver(reply)
+    msg = tool_error(srv, "manage_k8s_resource", human, target="dev", dry_run=True, **DELETE_CM)
+    assert expect in msg and "nothing was sent" in msg
+    assert len(human.prompts) == 1
+    assert cm.calls == [] and "write" not in modes
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_unprotected_write_proceeds_after_approval(writable, dry_run):
+    srv, _, cm, _, modes = writable
+    human = Approver()
+    out = result(srv, "manage_k8s_resource", human, target="dev", dry_run=dry_run, **DELETE_CM)
     assert out["_target"]["mode"] == "write"
+    assert cm.calls[0][0] == "delete"
+    assert human.schemas[0]["required"] == ["approve"]
+    assert_write_profile_only_after_approval(modes)
+
+
+def test_prompt_tells_the_human_exactly_what_will_happen(writable):
+    srv, _, _, _, _ = writable
+    human = Approver()
+    result(srv, "manage_k8s_resource", human, target="dev", operation="patch", kind="ConfigMap", name="cm",
+           namespace="app", body={"data": {"k": "changed"}}, dry_run=True)
+    t = srv.registry.resolve("dev")
+    prompt, = human.prompts
+    assert prompt.startswith("DRY RUN (server-side, not persisted): patch v1 ConfigMap app/cm")
+    assert f"Cluster: {t.cluster_name}" in prompt
+    assert f"Account: {t.account_id}" in prompt and f"env: {t.env}" in prompt
+    assert f"Write profile: {t.write_profile}" in prompt
+    assert "k: changed" in prompt  # the body itself is shown
+
+
+def test_real_write_is_labelled_as_such(writable):
+    srv, *_ = writable
+    human = Approver()
+    result(srv, "manage_k8s_resource", human, target="dev", **DELETE_CM)
+    assert human.prompts[0].startswith("WRITE: delete v1 ConfigMap app/cm")
+
+
+def test_apply_prompt_lists_every_object_and_the_yaml(writable):
+    srv, *_ = writable
+    human = Approver()
+    doc = "apiVersion: v1\nkind: Namespace\nmetadata: {name: n1}\n---\n" \
+          "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: c1, namespace: n1}\ndata: {k: v}\n"
+    result(srv, "apply_yaml", human, target="dev", yaml_content=doc, force_conflicts=True)
+    prompt, = human.prompts
+    assert "server-side apply of 2 object(s) with force_conflicts" in prompt
+    assert "  Namespace n1\n  ConfigMap n1/c1" in prompt
+    assert "data:\n  k: v" in prompt
+
+
+def test_huge_bodies_are_truncated_in_the_prompt(writable):
+    srv, _, cm, _, _ = writable
+    human = Approver()
+    body = {**CM, "data": {"blob": "x" * 20_000}}
+    result(srv, "manage_k8s_resource", human, target="dev", operation="create", kind="ConfigMap", name="cm",
+           namespace="app", body=body)
+    assert len(human.prompts[0]) < 5000 and "more characters" in human.prompts[0]
+    assert cm.calls[0][1]["body"] == body  # truncation is for display only
+
+
+def test_no_prompt_for_invalid_requests(writable):
+    srv, _, cm, _, _ = writable
+    human = Approver()
+    tool_error(srv, "manage_k8s_resource", human, target="dev", operation="create", kind="ConfigMap", name="cm",
+               namespace="app")
+    tool_error(srv, "apply_yaml", human, target="dev", yaml_content="a: [unclosed")
+    assert human.prompts == [] and cm.calls == []
+
+
+# ------------------------------------------------------------------ protected environments
+@pytest.mark.parametrize("typed", ["", "prod-blue", "web-prod-blue ", "WEB-PROD-BLUE", "web-prod"])
+def test_protected_env_needs_the_exact_cluster_name_typed(writable, typed):
+    srv, _, cm, _, modes = writable
+    human = Approver({"cluster_name": typed})
+    msg = tool_error(srv, "manage_k8s_resource", human, target="prod-blue", dry_run=True, **DELETE_CM)
+    assert "did not match 'web-prod-blue'" in msg and "nothing was sent" in msg
+    assert cm.calls == [] and "write" not in modes
+
+
+def test_protected_env_asks_for_the_name_not_a_yes(writable):
+    srv, _, cm, _, _ = writable
+    msg = tool_error(srv, "manage_k8s_resource", Approver({"approve": True}), target="prod-blue", **DELETE_CM)
+    assert "malformed" in msg and cm.calls == []
+
+
+def test_protected_env_proceeds_when_name_typed(writable):
+    srv, _, cm, _, modes = writable
+    human = Approver()
+    out = result(srv, "manage_k8s_resource", human, target="prod-blue", dry_run=True, **DELETE_CM)
+    assert out["_target"]["cluster"] == "web-prod-blue"
+    assert "PROTECTED ENVIRONMENT. Type the cluster name 'web-prod-blue' to approve." in human.prompts[0]
+    assert human.schemas[0]["required"] == ["cluster_name"]
     assert cm.calls == [("delete", {"name": "cm", "namespace": "app", "dry_run": "All"})]
+    assert_write_profile_only_after_approval(modes)
 
 
-@pytest.mark.parametrize("confirm", ["shop", "prod-blue", "333333333333/web-prod-blue"])
-def test_protected_env_rejects_aliases_as_confirmation(files, monkeypatch, confirm):
-    """The confirmation must be the real cluster name, never an alias that resolved to it."""
+@pytest.mark.parametrize("target", ["shop", "prod-blue", "333333333333/web-prod-blue"])
+def test_protected_env_rejects_aliases_typed_as_the_name(files, monkeypatch, target):
+    """The typed name must be the real cluster name, never an alias that resolved to it."""
     srv = make_server(files, safety={"allow_write": True},
                       clusters=[{"cluster_name": "web-prod-blue", "region": "us-east-1",
                                  "account_id": "333333333333", "alias": "shop"}])
-    assert srv.registry.resolve(confirm).cluster_name == "web-prod-blue"
+    assert srv.registry.resolve(target).cluster_name == "web-prod-blue"
     cm = FakeResource("ConfigMap")
     install_dynamic(monkeypatch, srv, FakeDynamic(cm))
-    msg = tool_error(srv, "manage_k8s_resource", target=confirm, operation="delete", kind="ConfigMap",
-                     name="cm", namespace="app", confirm_cluster=confirm)
-    assert "confirm_cluster='web-prod-blue'" in msg and cm.calls == []
+    msg = tool_error(srv, "manage_k8s_resource", Approver({"cluster_name": target}), target=target, **DELETE_CM)
+    assert "did not match" in msg and cm.calls == []
 
 
 @pytest.mark.parametrize("env,protected", [
@@ -69,27 +185,20 @@ def test_protected_env_matches_across_spellings(files, monkeypatch, env, protect
     srv = make_server(files, safety={"allow_write": True, "protected_envs": protected},
                       accounts={"111111111111": {"env": env}})
     install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
-    msg = tool_error(srv, "manage_k8s_resource", target="dev", operation="delete", kind="ConfigMap",
-                     name="cm", namespace="app")
-    assert "protected env" in msg
-
-
-def test_unprotected_env_needs_no_confirm(writable):
-    srv, _, cm, _, _ = writable
-    result(srv, "manage_k8s_resource", target="dev", operation="delete", kind="ConfigMap", name="cm",
-           namespace="app")
-    assert cm.calls[0][0] == "delete"
+    human = Approver({"approve": True})
+    assert "malformed" in tool_error(srv, "manage_k8s_resource", human, target="dev", **DELETE_CM)
+    assert "PROTECTED ENVIRONMENT" in human.prompts[0]
 
 
 def test_account_read_only_beats_allow_write(files, monkeypatch):
     srv = make_server(files, safety={"allow_write": True}, accounts={"111111111111": {"read_only": True}})
     install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
-    assert "read_only" in tool_error(srv, "apply_yaml", target="dev", yaml_content="kind: x")
+    assert "read_only" in tool_error(srv, "apply_yaml", Approver(), target="dev", yaml_content="kind: x")
 
 
 def test_unknown_target_is_a_clean_error(writable):
     srv, *_ = writable
-    assert "unknown target 'nope'" in tool_error(srv, "apply_yaml", target="nope", yaml_content="kind: x")
+    assert "unknown target 'nope'" in tool_error(srv, "apply_yaml", Approver(), target="nope", yaml_content="kind: x")
 
 
 # ------------------------------------------------------------------ manage_k8s_resource
@@ -97,9 +206,9 @@ def test_unknown_target_is_a_clean_error(writable):
 @pytest.mark.parametrize("dry_run", [True, False])
 def test_manage_operations_use_write_client_and_forward_dry_run(writable, op, dry_run):
     srv, _, cm, _, modes = writable
-    out = result(srv, "manage_k8s_resource", target="dev", operation=op, kind="ConfigMap", name="cm",
+    out = result(srv, "manage_k8s_resource", Approver(), target="dev", operation=op, kind="ConfigMap", name="cm",
                  namespace="app", body=None if op == "delete" else CM, dry_run=dry_run)
-    assert set(modes) == {"write"}
+    assert_write_profile_only_after_approval(modes)
     (verb, kw), = cm.calls
     assert verb == op
     assert kw["namespace"] == "app"
@@ -115,21 +224,21 @@ def test_manage_operations_use_write_client_and_forward_dry_run(writable, op, dr
 @pytest.mark.parametrize("op", ["create", "replace", "patch"])
 def test_manage_requires_body(writable, op):
     srv, _, cm, _, _ = writable
-    assert "needs a body" in tool_error(srv, "manage_k8s_resource", target="dev", operation=op,
+    assert "needs a body" in tool_error(srv, "manage_k8s_resource", Approver(), target="dev", operation=op,
                                         kind="ConfigMap", name="cm", namespace="app")
     assert cm.calls == []
 
 
 def test_manage_namespaced_kind_requires_namespace(writable):
     srv, _, cm, _, _ = writable
-    msg = tool_error(srv, "manage_k8s_resource", target="dev", operation="delete", kind="ConfigMap", name="cm")
+    msg = tool_error(srv, "manage_k8s_resource", Approver(), target="dev", operation="delete", kind="ConfigMap", name="cm")
     assert "namespaced; pass a namespace" in msg
     assert cm.calls == []
 
 
 def test_manage_cluster_scoped_kind_drops_namespace(writable):
     srv, _, _, ns, _ = writable
-    result(srv, "manage_k8s_resource", target="dev", operation="delete", kind="Namespace", name="x",
+    result(srv, "manage_k8s_resource", Approver(), target="dev", operation="delete", kind="Namespace", name="x",
            namespace="ignored")
     assert ns.calls == [("delete", {"name": "x", "namespace": None})]
 
@@ -139,7 +248,7 @@ def test_manage_delete_status_response_reports_details(writable):
     srv, _, cm, _, _ = writable
     cm.delete_response = {"kind": "Status", "apiVersion": "v1", "metadata": {}, "status": "Success",
                           "details": {"name": "cm", "kind": "configmaps", "uid": "u1"}}
-    out = result(srv, "manage_k8s_resource", target="dev", operation="delete", kind="ConfigMap", name="cm",
+    out = result(srv, "manage_k8s_resource", Approver(), target="dev", operation="delete", kind="ConfigMap", name="cm",
                  namespace="app", dry_run=True)
     assert out["result"]["status"] == "Success"
     assert out["result"]["details"]["name"] == "cm"
@@ -147,14 +256,14 @@ def test_manage_delete_status_response_reports_details(writable):
 
 def test_manage_create_returns_summary(writable):
     srv, *_ = writable
-    out = result(srv, "manage_k8s_resource", target="dev", operation="create", kind="ConfigMap", name="cm",
+    out = result(srv, "manage_k8s_resource", Approver(), target="dev", operation="create", kind="ConfigMap", name="cm",
                  namespace="app", body=CM)
     assert out["result"] == {"name": "cm", "namespace": "app", "created": "2026-01-01T00:00:00Z"}
 
 
 def test_manage_unknown_kind(writable):
     srv, *_ = writable
-    msg = tool_error(srv, "manage_k8s_resource", target="dev", operation="delete", kind="Widget", name="w",
+    msg = tool_error(srv, "manage_k8s_resource", Approver(), target="dev", operation="delete", kind="Widget", name="w",
                      namespace="app")
     assert "no resource kind 'Widget'" in msg
 
@@ -179,8 +288,8 @@ metadata: {name: b}
 @pytest.mark.parametrize("dry_run", [True, False])
 def test_apply_multi_document(writable, dry_run):
     srv, dyn, _, _, modes = writable
-    out = result(srv, "apply_yaml", target="dev", yaml_content=MULTI, namespace="fallback", dry_run=dry_run)
-    assert set(modes) == {"write"}
+    out = result(srv, "apply_yaml", Approver(), target="dev", yaml_content=MULTI, namespace="fallback", dry_run=dry_run)
+    assert_write_profile_only_after_approval(modes)
     assert [(a["kind"], a["name"], a["namespace"]) for a in dyn.applied] == [
         ("Namespace", "app", None),  # cluster-scoped: metadata.namespace ignored
         ("ConfigMap", "a", "explicit"),  # document namespace wins
@@ -195,7 +304,7 @@ def test_apply_multi_document(writable, dry_run):
 
 def test_apply_forwards_force_conflicts(writable):
     srv, dyn, *_ = writable
-    result(srv, "apply_yaml", target="dev", yaml_content=MULTI, namespace="x", force_conflicts=True)
+    result(srv, "apply_yaml", Approver(), target="dev", yaml_content=MULTI, namespace="x", force_conflicts=True)
     assert all(a["force_conflicts"] is True for a in dyn.applied)
 
 
@@ -210,7 +319,7 @@ def test_apply_forwards_force_conflicts(writable):
 ])
 def test_apply_rejects_bad_documents_cleanly(writable, doc, expect):
     srv, dyn, *_ = writable
-    assert expect in tool_error(srv, "apply_yaml", target="dev", yaml_content=doc)
+    assert expect in tool_error(srv, "apply_yaml", Approver(), target="dev", yaml_content=doc)
     assert dyn.applied == []
 
 
@@ -218,12 +327,12 @@ def test_apply_validates_all_documents_before_applying_any(writable):
     """Regression: a bad document late in the stream left earlier ones applied."""
     srv, dyn, *_ = writable
     doc = MULTI + "apiVersion: v1\nkind: Widget\nmetadata: {name: w}\n"
-    assert "no resource kind 'Widget'" in tool_error(srv, "apply_yaml", target="dev", yaml_content=doc,
+    assert "no resource kind 'Widget'" in tool_error(srv, "apply_yaml", Approver(), target="dev", yaml_content=doc,
                                                       namespace="x")
     assert dyn.applied == []
 
 
 def test_apply_invalid_yaml_is_a_tool_error(writable):
     srv, dyn, *_ = writable
-    tool_error(srv, "apply_yaml", target="dev", yaml_content="a: [unclosed")
+    tool_error(srv, "apply_yaml", Approver(), target="dev", yaml_content="a: [unclosed")
     assert dyn.applied == []

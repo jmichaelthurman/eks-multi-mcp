@@ -2,18 +2,20 @@
 
     EKS_MULTI_MCP_LIVE_TARGET=<non-prod target> \\
     EKS_MULTI_MCP_LIVE_PROTECTED_TARGET=<prod target> \\
-    .venv/bin/python -m pytest -m live -v
+    .venv/bin/python -m pytest -m live -v -s
 
-Every write is a server-side dry run, and each one is followed by a read proving nothing
-persisted. The protected target only ever receives calls the gate must refuse before any
-API request is made. Skipped entirely when EKS_MULTI_MCP_LIVE_TARGET is unset.
+Every write is a server-side dry run, followed by a read proving nothing persisted, and
+each one is shown to you on the terminal and sent only if you approve it there; without a
+terminal (no -s, or CI) the write checks skip. The protected target only ever receives
+approval answers that must be refused, and the write profile is never used against it.
+Skipped entirely when EKS_MULTI_MCP_LIVE_TARGET is unset.
 """
 
 import os
 import uuid
 
 import pytest
-from fakes import call, result, tool_error
+from fakes import Approver, call, result, tool_error
 
 from eks_multi_mcp.config import load_settings
 from eks_multi_mcp.registry import normalize_env
@@ -44,6 +46,35 @@ def srv():
     if t.env and normalize_env(t.env) in protected:
         pytest.exit(f"EKS_MULTI_MCP_LIVE_TARGET '{TARGET}' is in protected env '{t.env}'; use a non-prod target")
     return srv
+
+
+class TerminalHuman:
+    """Approval prompt answered by the person running the tests, on their terminal."""
+
+    def __init__(self):
+        try:
+            self.tty = open("/dev/tty", "r+")  # noqa: SIM115 - held for the session
+        except OSError:
+            pytest.skip("live write checks need a terminal to ask you for approval (run with -s)")
+
+    async def __call__(self, context, params):
+        import mcp_types as types
+
+        props = params.requested_schema["properties"]
+        self.tty.write("\n" + "=" * 70 + "\n" + params.message + "\n")
+        if "cluster_name" in props:
+            self.tty.write("cluster name> ")
+            self.tty.flush()
+            return types.ElicitResult(action="accept", content={"cluster_name": self.tty.readline().strip()})
+        self.tty.write("approve? [y/N]> ")
+        self.tty.flush()
+        yes = self.tty.readline().strip().lower() in ("y", "yes")
+        return types.ElicitResult(action="accept" if yes else "decline", content={"approve": True} if yes else None)
+
+
+@pytest.fixture(scope="module")
+def human():
+    return TerminalHuman()
 
 
 def _absent(srv, kind, name):
@@ -99,16 +130,16 @@ def test_read_only_server_refuses_writes():
                                      kind="ConfigMap", name=PROBE, namespace=NS, dry_run=True)
 
 
-def test_apply_yaml_dry_run_persists_nothing(srv):
+def test_apply_yaml_dry_run_persists_nothing(srv, human):
     name = f"eks-multi-mcp-live-{uuid.uuid4().hex[:8]}"
     doc = f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: {name}, namespace: {NS}}}\ndata: {{k: v}}\n"
-    out = result(srv, "apply_yaml", target=TARGET, yaml_content=doc, dry_run=True)
+    out = result(srv, "apply_yaml", human, target=TARGET, yaml_content=doc, dry_run=True)
     assert out["_target"]["mode"] == "write" and out["result"][0]["dry_run"] is True
     _absent(srv, "ConfigMap", name)
 
 
 @pytest.mark.parametrize("op", ["create", "replace", "patch", "delete"])
-def test_manage_dry_run_persists_nothing(srv, op):
+def test_manage_dry_run_persists_nothing(srv, human, op):
     before = result(srv, "get_k8s_resource", target=TARGET, kind="ConfigMap", name=PROBE, namespace=NS,
                     output="json")["result"]
     name = PROBE if op != "create" else f"eks-multi-mcp-live-{uuid.uuid4().hex[:8]}"
@@ -118,7 +149,7 @@ def test_manage_dry_run_persists_nothing(srv, op):
         body["metadata"]["resourceVersion"] = before["metadata"]["resourceVersion"]
     if op == "patch":
         body = {"metadata": {"labels": {"eks-multi-mcp-live": "dry-run"}}}
-    out = result(srv, "manage_k8s_resource", target=TARGET, operation=op, kind="ConfigMap", name=name,
+    out = result(srv, "manage_k8s_resource", human, target=TARGET, operation=op, kind="ConfigMap", name=name,
                  namespace=NS, body=None if op == "delete" else body, dry_run=True)
     assert out["_target"]["mode"] == "write" and out["dry_run"] is True
     if op == "create":
@@ -131,19 +162,28 @@ def test_manage_dry_run_persists_nothing(srv, op):
 
 
 @pytest.mark.skipif(not PROTECTED, reason="set EKS_MULTI_MCP_LIVE_PROTECTED_TARGET to check the prod gate")
-@pytest.mark.parametrize("confirm", [None, "wrong-cluster", PROTECTED])
-def test_protected_gate_refuses_before_any_request(srv, monkeypatch, confirm):
+@pytest.mark.parametrize("reply", ["no-prompt", "decline", {"approve": True}, {"cluster_name": "wrong-cluster"},
+                                   "alias"])
+def test_protected_target_refuses_without_the_typed_cluster_name(srv, monkeypatch, reply):
     t = srv.registry.resolve(PROTECTED)
-    if confirm == t.cluster_name:
-        pytest.skip("the protected target was given by its cluster name; alias check not applicable")
+    if reply == "alias":
+        if PROTECTED == t.cluster_name:
+            pytest.skip("the protected target was given by its cluster name; alias check not applicable")
+        reply = {"cluster_name": PROTECTED}
+    read_client = srv.auth.dynamic
 
-    def no_clients(*a, **k):
-        raise AssertionError("the gate let a request through to the cluster")
+    def read_only(target, mode="read"):
+        if mode != "read":
+            raise AssertionError("the write profile was used before approval")
+        return read_client(target, mode)
 
-    monkeypatch.setattr(srv.auth, "dynamic", no_clients)
-    msg = tool_error(srv, "manage_k8s_resource", target=PROTECTED, operation="delete", kind="ConfigMap",
-                     name=PROBE, namespace=NS, dry_run=True, confirm_cluster=confirm)
-    assert f"confirm_cluster='{t.cluster_name}'" in msg
+    monkeypatch.setattr(srv.auth, "dynamic", read_only)
+    human = None if reply == "no-prompt" else Approver(reply)
+    msg = tool_error(srv, "manage_k8s_resource", human, target=PROTECTED, operation="delete", kind="ConfigMap",
+                     name=PROBE, namespace=NS, dry_run=True)
+    assert "nothing was sent" in msg
+    if human:
+        assert f"Type the cluster name '{t.cluster_name}'" in human.prompts[0]
 
 
 def test_unknown_target_lists_suggestions(srv):

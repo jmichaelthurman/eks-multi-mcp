@@ -16,9 +16,11 @@ import yaml
 from botocore.exceptions import BotoCoreError, ClientError
 from kubernetes.client.exceptions import ApiException
 from kubernetes.dynamic.exceptions import DynamicApiError, ResourceNotFoundError
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp_types import ToolAnnotations
+from mcp.shared.exceptions import NoBackChannelError
+from mcp_types import ClientCapabilities, ElicitationCapability, ToolAnnotations
+from pydantic import BaseModel, Field
 
 from .auth import AuthManager, CredentialError, explain_aws_error
 from .config import Settings
@@ -35,14 +37,25 @@ Multi-account, multi-cluster Amazon EKS server.
   rely on the answer, especially when comparing environments.
 - Fleet tools (`fleet_*`) take a selector such as `env:dev`, `account:team-*`,
   `web-*`, or `*`.
-- Reads use each account's read profile; writes use its write profile. Writes to a
-  protected environment (prod by default) require `confirm_cluster=<cluster name>`.
+- Reads use each account's read profile; writes use its write profile. Every write,
+  dry runs included, pauses for a human to approve it in the MCP client; in a
+  protected environment (prod by default) the human must type the cluster name.
+  Clients that cannot show that prompt cannot write.
 - Run `doctor` when access fails: it pinpoints expired SSO, stale kube contexts and
   exec blocks pointed at the wrong account.
 """
 
 MAX_ITEMS = 500
 SENSITIVE_KINDS = {"Secret"}
+PROMPT_DETAIL_CHARS = 4000
+
+
+class WriteApproval(BaseModel):
+    approve: bool = Field(description="Approve this write")
+
+
+class ProtectedWriteApproval(BaseModel):
+    cluster_name: str = Field(description="Type the cluster name to approve this write")
 
 
 class EksMultiServer:
@@ -67,17 +80,61 @@ class EksMultiServer:
                 "--allow-sensitive-data-access"
             )
 
-    def require_write(self, t: Target, confirm_cluster: str | None) -> None:
+    def require_write(self, t: Target) -> None:
         if not self.settings.allow_write:
             raise ToolError("the server is read-only; restart it with --allow-write to enable writes")
         if t.read_only:
             raise ToolError(f"target '{t.alias}' is marked read_only in the cluster map")
+
+    def is_protected(self, t: Target) -> bool:
         protected = {normalize_env(e) for e in self.settings.protected_envs}
-        if t.env and normalize_env(t.env) in protected and confirm_cluster != t.cluster_name:
-            raise ToolError(
-                f"'{t.alias}' is in protected env '{t.env}' (account {t.account_id}). "
-                f"Re-issue the call with confirm_cluster='{t.cluster_name}' to proceed."
-            )
+        return bool(t.env) and normalize_env(t.env) in protected
+
+    def approve(self, ctx: Context, t: Target, action: str, detail: str, dry_run: bool) -> None:
+        """Ask the human, through the MCP client, to approve one write. Called from a worker
+        thread after validation and before anything uses the write profile. Fails closed:
+        no prompt, no answer, or any answer but an explicit approval means no write.
+
+        The calling agent never supplies the approval itself; it comes back from the client's
+        elicitation prompt, which the client shows to its user."""
+        refused = "nothing was sent to the cluster"
+        try:
+            can_prompt = ctx.session.check_client_capability(
+                ClientCapabilities(elicitation=ElicitationCapability()))
+        except Exception:  # noqa: BLE001 - no live session (e.g. called outside a client connection)
+            can_prompt = False
+        if not can_prompt:
+            raise ToolError("writes need a human to approve them, but this MCP client cannot show an "
+                            f"approval prompt (no elicitation support); {refused}")
+
+        protected = self.is_protected(t)
+        if len(detail) > PROMPT_DETAIL_CHARS:
+            detail = detail[:PROMPT_DETAIL_CHARS] + f"\n... ({len(detail) - PROMPT_DETAIL_CHARS} more characters)"
+        lines = [
+            f"{'DRY RUN (server-side, not persisted)' if dry_run else 'WRITE'}: {action}",
+            f"Cluster: {t.cluster_name}  ({t.region})",
+            f"Account: {t.account_id} ({t.account_name or 'unnamed'})  env: {t.env or 'unknown'}",
+            f"Write profile: {t.write_profile}",
+            "",
+            detail,
+            "",
+            (f"PROTECTED ENVIRONMENT. Type the cluster name '{t.cluster_name}' to approve."
+             if protected else "Approve this write?"),
+        ]
+        schema = ProtectedWriteApproval if protected else WriteApproval
+        try:
+            answer = anyio.from_thread.run(ctx.elicit, "\n".join(lines), schema)
+        except NoBackChannelError as e:
+            raise ToolError(f"this MCP connection cannot show an approval prompt; {refused}") from e
+        except ValueError as e:
+            raise ToolError(f"the approval response was malformed; {refused}") from e
+        if answer.action != "accept":
+            raise ToolError(f"the write was not approved ({answer.action}); {refused}")
+        if protected and answer.data.cluster_name != t.cluster_name:
+            raise ToolError(f"the typed cluster name did not match '{t.cluster_name}'; {refused}")
+        if not protected and answer.data.approve is not True:
+            raise ToolError(f"the write was not approved; {refused}")
+        log.warning("write approved by user: %s on %s (%s)", action, t.cluster_name, t.account_id)
 
     @staticmethod
     def wrap(t: Target, data: Any, mode: str = "read", **extra) -> dict:
@@ -449,12 +506,13 @@ class EksMultiServer:
             return self.wrap(t, core.read_namespaced_pod_log(pod_name, namespace, **kw))
 
         @tool(write=True)
-        def apply_yaml(target: str, yaml_content: str, namespace: str | None = None, dry_run: bool = False,
-                       force_conflicts: bool = False, confirm_cluster: str | None = None) -> dict:
+        def apply_yaml(ctx: Context, target: str, yaml_content: str, namespace: str | None = None,
+                       dry_run: bool = False, force_conflicts: bool = False) -> dict:
             """Server-side apply one or more YAML documents, authenticated with the target's
-            write profile. Requires --allow-write; protected envs require confirm_cluster."""
+            write profile. Requires --allow-write, and a human must approve the write in the
+            MCP client (in protected envs, by typing the cluster name)."""
             t = self.target(target)
-            self.require_write(t, confirm_cluster)
+            self.require_write(t)
             try:
                 docs = [d for d in yaml.safe_load_all(yaml_content) if d]
             except yaml.YAMLError as e:
@@ -470,12 +528,17 @@ class EksMultiServer:
                 md = d.get("metadata") or {}
                 if not (d.get("apiVersion") and d.get("kind") and md.get("name")):
                     raise ToolError(f"document {i} needs apiVersion, kind and metadata.name")
-                res = self._resource(t, d["apiVersion"], d["kind"], mode="write")
+                res = self._resource(t, d["apiVersion"], d["kind"])
                 ns = _namespace(res, md.get("namespace") or namespace, f"document {i} ({d['kind']})")
-                plan.append((d, res, ns))
+                plan.append((d, ns))
+            objects = "\n".join(f"  {d['kind']} {(ns + '/') if ns else ''}{d['metadata']['name']}" for d, ns in plan)
+            self.approve(ctx, t, f"server-side apply of {len(plan)} object(s)"
+                         + (" with force_conflicts" if force_conflicts else ""),
+                         f"{objects}\n\n" + yaml.safe_dump_all([d for d, _ in plan], sort_keys=False), dry_run)
             dyn = self.auth.dynamic(t, "write")
             results = []
-            for d, res, ns in plan:
+            for d, ns in plan:
+                res = self._resource(t, d["apiVersion"], d["kind"], mode="write")
                 kw: dict[str, Any] = {"field_manager": "eks-multi-mcp", "force_conflicts": force_conflicts}
                 if dry_run:
                     kw["dry_run"] = "All"
@@ -485,22 +548,25 @@ class EksMultiServer:
             return self.wrap(t, results, mode="write")
 
         @tool(write=True)
-        def manage_k8s_resource(target: str, operation: Literal["create", "replace", "patch", "delete"],
+        def manage_k8s_resource(ctx: Context, target: str,
+                                operation: Literal["create", "replace", "patch", "delete"],
                                 kind: str, name: str, api_version: str = "v1", namespace: str | None = None,
-                                body: dict | None = None, dry_run: bool = False,
-                                confirm_cluster: str | None = None) -> dict:
+                                body: dict | None = None, dry_run: bool = False) -> dict:
             """Create, replace, merge-patch or delete one resource with the target's write profile.
-            Requires --allow-write; protected envs require confirm_cluster."""
+            Requires --allow-write, and a human must approve the write in the MCP client (in
+            protected envs, by typing the cluster name)."""
             t = self.target(target)
-            self.require_write(t, confirm_cluster)
+            self.require_write(t)
+            ns = _namespace(self._resource(t, api_version, kind), namespace, kind)
+            if operation != "delete" and body is None:
+                raise ToolError(f"'{operation}' needs a body")
+            self.approve(ctx, t, f"{operation} {api_version} {kind} {(ns + '/') if ns else ''}{name}",
+                         "" if body is None else yaml.safe_dump(body, sort_keys=False), dry_run)
             res = self._resource(t, api_version, kind, mode="write")
-            ns = _namespace(res, namespace, kind)
             kw: dict[str, Any] = {"dry_run": "All"} if dry_run else {}
             if operation == "delete":
                 out = res.delete(name=name, namespace=ns, **kw)
             else:
-                if body is None:
-                    raise ToolError(f"'{operation}' needs a body")
                 if operation == "create":
                     out = res.create(body=body, namespace=ns, **kw)
                 elif operation == "replace":

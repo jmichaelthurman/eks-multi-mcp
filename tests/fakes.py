@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 from types import SimpleNamespace
 
 from kubernetes.dynamic.exceptions import ResourceNotFoundError
@@ -21,15 +22,54 @@ def make_server(files, **extra) -> EksMultiServer:
     return EksMultiServer(settings_from_dict({**files, **extra}))
 
 
-def call(srv, tool_name, **args):
-    return asyncio.run(srv.mcp.call_tool(tool_name, args))
+class Approver:
+    """Plays the human at the MCP client's approval prompt and records what it was shown.
+
+    reply: "approve" (types the cluster name shown in the prompt when one is asked for),
+    "decline", "cancel", or a dict sent verbatim as the form content.
+    """
+
+    def __init__(self, reply="approve"):
+        self.reply = reply
+        self.prompts: list[str] = []
+        self.schemas: list[dict] = []
+
+    async def __call__(self, context, params):
+        import mcp_types as types
+
+        self.prompts.append(params.message)
+        self.schemas.append(params.requested_schema)
+        if self.reply in ("decline", "cancel"):
+            return types.ElicitResult(action=self.reply)
+        if isinstance(self.reply, dict):
+            return types.ElicitResult(action="accept", content=self.reply)
+        if "cluster_name" in params.requested_schema["properties"]:
+            shown = re.search(r"^Cluster: (\S+)", params.message, re.MULTILINE).group(1)
+            return types.ElicitResult(action="accept", content={"cluster_name": shown})
+        return types.ElicitResult(action="accept", content={"approve": True})
 
 
-def result(srv, tool_name, **args):
-    """Decoded JSON result of a tool call. Tool failures raise ToolError from call_tool."""
-    res = call(srv, tool_name, **args)
-    assert not getattr(res, "is_error", False), res.content[0].text
-    return json.loads(res.content[0].text)
+def call(srv, tool_name, approver=None, **args):
+    """Call a tool through a real in-process MCP client. Without an approver the client
+    declares no elicitation support, like a client that cannot prompt its user.
+    A tool error is raised as ToolError with the server's message."""
+    from mcp.client.client import Client
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    async def run():
+        kw = {"elicitation_callback": approver} if approver else {}
+        async with Client(srv.mcp, mode="legacy", **kw) as client:
+            return await client.call_tool(tool_name, args)
+
+    res = asyncio.run(run())
+    if res.is_error:
+        raise ToolError(res.content[0].text.removeprefix(f"Error executing tool {tool_name}: "))
+    return res
+
+
+def result(srv, tool_name, approver=None, **args):
+    """Decoded JSON result of a tool call."""
+    return json.loads(call(srv, tool_name, approver, **args).content[0].text)
 
 
 class Obj:
@@ -156,15 +196,15 @@ def install_aws(monkeypatch, srv, **clients) -> list[tuple[str, str]]:
     return seen
 
 
-def tool_error(srv, tool_name, **args) -> str:
-    """Message of the ToolError a call raises. Fails if the call succeeds or crashes with an
-    unmapped exception (UnexpectedToolError), which the client would see as an internal error."""
-    from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+def tool_error(srv, tool_name, approver=None, **args) -> str:
+    """Message of the error a call reports. Fails if the call succeeds, or if it crashed with
+    an unmapped exception (the client then sees only a bare 'Error executing tool')."""
+    from mcp.server.mcpserver.exceptions import ToolError
 
     try:
-        call(srv, tool_name, **args)
-    except UnexpectedToolError as e:
-        raise AssertionError(f"unmapped exception: {e.__cause__!r}") from e
+        call(srv, tool_name, approver, **args)
     except ToolError as e:
-        return str(e)
-    raise AssertionError(f"{tool_name} succeeded; expected a ToolError")
+        msg = str(e)
+        assert msg != f"Error executing tool {tool_name}", "unmapped exception (no detail reached the client)"
+        return msg
+    raise AssertionError(f"{tool_name} succeeded; expected an error")

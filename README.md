@@ -44,8 +44,16 @@ That makes it immune to the usual kubeconfig traps, and `doctor` reports each on
 
 - **Read-only by default.** Write tools (`apply_yaml`, `manage_k8s_resource`) need `--allow-write`.
 - Writes use the target's **write profile**; reads always use the **read profile**.
-- Writes to a protected env (`safety.protected_envs`, default `prd`, `prod`, `production`)
-  also need `confirm_cluster=<cluster name>`.
+- **Every write needs a human to approve it, dry runs included.** Before anything uses the
+  write profile, the server sends an MCP elicitation prompt to the client. The prompt shows
+  the cluster, account, env, write profile, operation and the full YAML or body, and the
+  write goes ahead only if the user approves. The calling agent can't supply the approval.
+- In a protected env (`safety.protected_envs`, default `prd`, `prod`, `production`), the user
+  must **type the cluster name** into that prompt; an alias doesn't count.
+- **Fails closed.** If the client can't show an elicitation prompt, or the user declines,
+  cancels, or answers anything else, nothing is sent to the cluster.
+- Approval is only as good as the client: use a client that shows elicitation prompts to
+  you, never one that answers them automatically.
 - `read_only: true` on an account or cluster in the map overrides `--allow-write`.
 - Pod logs, CloudWatch logs and Secret values need `--allow-sensitive-data-access`.
   Without it, Secrets come back with their values redacted.
@@ -121,7 +129,7 @@ uv run eks-multi-mcp serve                 # stdio MCP server (default command)
 
 ```bash
 claude mcp add eks-multi -- uv run --directory /path/to/eks-multi-mcp eks-multi-mcp
-# with writes enabled (prod still needs confirm_cluster):
+# with writes enabled (each write still asks you to approve it):
 claude mcp add eks-multi-rw -- uv run --directory /path/to/eks-multi-mcp eks-multi-mcp --allow-write
 ```
 

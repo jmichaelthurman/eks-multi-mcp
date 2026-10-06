@@ -24,7 +24,7 @@ profiles:
 safety:
   allow_write: false                  # same as --allow-write
   allow_sensitive_data_access: false  # pod/CloudWatch logs, unredacted Secrets
-  protected_envs: [prod]              # writes here need confirm_cluster=<cluster name>
+  protected_envs: [prod]              # approving a write here means typing the cluster name
 
 # Per-account defaults. Keys are account IDs (quote them).
 accounts:

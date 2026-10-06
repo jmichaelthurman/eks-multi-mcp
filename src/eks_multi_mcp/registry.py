@@ -20,6 +20,12 @@ _ENV_NORMAL = {"develop": "dev", "development": "dev", "stage": "stg", "staging"
                "production": "prod"}
 
 
+def normalize_env(env: str | None) -> str:
+    """Canonical spelling of an env name, so `prd` and `prod` compare equal."""
+    e = (env or "").lower()
+    return _ENV_NORMAL.get(e, e)
+
+
 def infer_env(*names: str | None) -> str | None:
     for n in names:
         if n and (m := _ENV_TOKEN.search(n)):

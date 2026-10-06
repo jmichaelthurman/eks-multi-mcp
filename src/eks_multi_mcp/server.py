@@ -22,7 +22,7 @@ from mcp_types import ToolAnnotations
 
 from .auth import AuthManager, CredentialError, explain_aws_error
 from .config import Settings
-from .registry import Registry, Target, TargetNotFound
+from .registry import Registry, Target, TargetNotFound, normalize_env
 
 log = logging.getLogger("eks_multi_mcp")
 
@@ -72,7 +72,8 @@ class EksMultiServer:
             raise ToolError("the server is read-only; restart it with --allow-write to enable writes")
         if t.read_only:
             raise ToolError(f"target '{t.alias}' is marked read_only in the cluster map")
-        if (t.env or "") in self.settings.protected_envs and confirm_cluster != t.cluster_name:
+        protected = {normalize_env(e) for e in self.settings.protected_envs}
+        if t.env and normalize_env(t.env) in protected and confirm_cluster != t.cluster_name:
             raise ToolError(
                 f"'{t.alias}' is in protected env '{t.env}' (account {t.account_id}). "
                 f"Re-issue the call with confirm_cluster='{t.cluster_name}' to proceed."
@@ -395,7 +396,8 @@ class EksMultiServer:
             res = self._resource(t, api_version, kind)
             obj = (res.get(name=name, namespace=namespace) if res.namespaced else res.get(name=name)).to_dict()
             (obj.get("metadata") or {}).pop("managedFields", None)
-            if kind in SENSITIVE_KINDS and not self.settings.allow_sensitive_data_access:
+            kinds = {kind, res.kind, getattr(res, "base_kind", None)}
+            if kinds & SENSITIVE_KINDS and not self.settings.allow_sensitive_data_access:
                 for k in ("data", "stringData"):
                     if obj.get(k):
                         obj[k] = {key: "<redacted>" for key in obj[k]}
@@ -453,14 +455,27 @@ class EksMultiServer:
             write profile. Requires --allow-write; protected envs require confirm_cluster."""
             t = self.target(target)
             self.require_write(t, confirm_cluster)
-            docs = [d for d in yaml.safe_load_all(yaml_content) if d]
+            try:
+                docs = [d for d in yaml.safe_load_all(yaml_content) if d]
+            except yaml.YAMLError as e:
+                raise ToolError(f"invalid YAML: {e}") from e
             if not docs:
                 raise ToolError("no YAML documents found")
+            # Resolve and validate every document before applying any, so a bad document
+            # late in the stream cannot leave the earlier ones half-applied.
+            plan = []
+            for i, d in enumerate(docs, 1):
+                if not isinstance(d, dict):
+                    raise ToolError(f"document {i} is not a mapping")
+                md = d.get("metadata") or {}
+                if not (d.get("apiVersion") and d.get("kind") and md.get("name")):
+                    raise ToolError(f"document {i} needs apiVersion, kind and metadata.name")
+                res = self._resource(t, d["apiVersion"], d["kind"], mode="write")
+                ns = _namespace(res, md.get("namespace") or namespace, f"document {i} ({d['kind']})")
+                plan.append((d, res, ns))
             dyn = self.auth.dynamic(t, "write")
             results = []
-            for d in docs:
-                res = self._resource(t, d["apiVersion"], d["kind"], mode="write")
-                ns = (d.get("metadata") or {}).get("namespace") or namespace if res.namespaced else None
+            for d, res, ns in plan:
                 kw: dict[str, Any] = {"field_manager": "eks-multi-mcp", "force_conflicts": force_conflicts}
                 if dry_run:
                     kw["dry_run"] = "All"
@@ -479,7 +494,7 @@ class EksMultiServer:
             t = self.target(target)
             self.require_write(t, confirm_cluster)
             res = self._resource(t, api_version, kind, mode="write")
-            ns = namespace if res.namespaced else None
+            ns = _namespace(res, namespace, kind)
             kw: dict[str, Any] = {"dry_run": "All"} if dry_run else {}
             if operation == "delete":
                 out = res.delete(name=name, namespace=ns, **kw)
@@ -494,7 +509,12 @@ class EksMultiServer:
                     out = res.patch(body=body, name=name, namespace=ns,
                                     content_type="application/merge-patch+json", **kw)
             d = out.to_dict() if hasattr(out, "to_dict") else out
-            return self.wrap(t, _summarize(d) if isinstance(d, dict) and "metadata" in d else d, mode="write",
+            if isinstance(d, dict) and d.get("kind") == "Status":
+                # Deletes may answer with a Status instead of the object.
+                d = {"status": d.get("status"), "details": d.get("details"), "message": d.get("message")}
+            elif isinstance(d, dict) and "metadata" in d:
+                d = _summarize(d)
+            return self.wrap(t, d, mode="write",
                              operation=operation, dry_run=dry_run)
 
         # ================================================================ fleet
@@ -633,6 +653,15 @@ def _k8s_error(e: Exception) -> str:
     hint = {401: " (token rejected: the IAM principal is not mapped to this cluster)",
             403: " (RBAC: the IAM principal lacks this permission)"}.get(status, "")
     return f"Kubernetes API {status} {reason}: {msg}{hint}".strip()
+
+
+def _namespace(res, namespace: str | None, what: str) -> str | None:
+    """Namespace to send for a write: required for namespaced kinds, dropped for cluster-scoped."""
+    if not res.namespaced:
+        return None
+    if not namespace:
+        raise ToolError(f"{what} is namespaced; pass a namespace")
+    return namespace
 
 
 def _selectors(label_selector: str | None, field_selector: str | None) -> dict:

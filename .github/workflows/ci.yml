@@ -22,3 +22,22 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run pytest -q --cov=eks_multi_mcp --cov-report=term-missing --cov-fail-under=90
+
+  # The git hooks only run in clones that set core.hooksPath. Re-run the guard's generic
+  # rules here (no local denylist exists in CI) so a clone without them can't slip through.
+  identifiers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked
+      - run: uv run python scripts/check_identifiers.py --all
+      - if: github.event_name == 'pull_request'
+        run: uv run python scripts/check_identifiers.py --range "$BASE..$HEAD"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}

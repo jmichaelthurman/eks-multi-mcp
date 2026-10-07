@@ -1,0 +1,11 @@
+#!/bin/sh
+# Refuse commits that contain secrets or real environment identifiers.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -e
+root=$(git rev-parse --show-toplevel)
+uv run --quiet --project "$root" python "$root/scripts/check_identifiers.py" --staged
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git "$root" --staged --no-banner --redact --log-level error
+else
+  echo "pre-commit: gitleaks not installed; secret scan skipped (brew install gitleaks)" >&2
+fi

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Commit messages are published too.
+root=$(git rev-parse --show-toplevel)
+exec uv run --quiet --project "$root" python "$root/scripts/check_identifiers.py" "$1"

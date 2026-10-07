@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+# Real configuration never lives in the repo; keep it in ~/.config/eks-multi-mcp/.
+/config.yaml
+*.local.yaml
+.eks-multi-mcp.yaml
+denylist.txt
+kubeconfig*
+!/src/eks_multi_mcp/kubeconfig.py
+.env
+.coverage

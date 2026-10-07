@@ -5,6 +5,8 @@ import fakes
 import pytest
 from fakes import Approver, FakeDynamic, FakeResource, install_dynamic, make_server, result, tool_error
 
+from eks_multi_mcp.server import PROMPT_DETAIL_CHARS
+
 
 @pytest.fixture(autouse=True, params=["legacy", "auto"])
 def client_mode(request, monkeypatch):
@@ -132,14 +134,84 @@ def test_apply_prompt_lists_every_object_and_the_yaml(writable):
     assert "data:\n  k: v" in prompt
 
 
-def test_huge_bodies_are_truncated_in_the_prompt(writable):
+def test_oversized_write_is_refused_not_truncated(writable):
+    """The review's repro: a large ConfigMap pushes a ClusterRoleBinding granting cluster-admin
+    past any display cutoff. The human must see everything they approve, so the write is
+    refused before any prompt rather than shown in part."""
+    srv, dyn, *_ = writable
+    dyn.add(FakeResource("ClusterRoleBinding", namespaced=False, api_version="rbac.authorization.k8s.io/v1"))
+    human = Approver()
+    doc = ("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: filler, namespace: app}\n"
+           f"data: {{blob: {'x' * PROMPT_DETAIL_CHARS}}}\n---\n"
+           "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata: {name: everyone-admin}\n"
+           "roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin}\n"
+           "subjects: [{apiGroup: rbac.authorization.k8s.io, kind: Group, name: 'system:authenticated'}]\n")
+    msg = tool_error(srv, "apply_yaml", human, target="dev", yaml_content=doc)
+    assert "too large to show in full for approval" in msg and "split it" in msg
+    assert human.prompts == [] and dyn.applied == []
+
+
+def test_oversized_manage_body_is_refused(writable):
     srv, _, cm, _, _ = writable
     human = Approver()
     body = {**CM, "data": {"blob": "x" * 20_000}}
+    msg = tool_error(srv, "manage_k8s_resource", human, target="dev", operation="create", kind="ConfigMap",
+                     name="cm", namespace="app", body=body)
+    assert "too large to show in full for approval" in msg
+    assert human.prompts == [] and cm.calls == []
+
+
+@pytest.mark.parametrize("field,value", [
+    ("name", "cm\nCluster: sandbox-throwaway  (us-east-1)"),  # the review's repro
+    ("name", "cm Cluster: elsewhere"),
+    ("name", "../cm"),
+    ("name", ""),
+    ("namespace", "app\nWrite profile: nobody"),
+    ("namespace", "App"),
+    ("kind", "ConfigMap\nCluster: x"),
+    ("api_version", "v1\nCluster: x"),
+])
+def test_names_that_could_spoof_the_prompt_are_refused(writable, field, value):
+    srv, _, cm, _, _ = writable
+    human = Approver()
+    args = {**DELETE_CM, "api_version": "v1", field: value}
+    msg = tool_error(srv, "manage_k8s_resource", human, target="dev", **args)
+    assert f"invalid {field.replace('_', '')}" in msg.replace("_", "")
+    assert human.prompts == [] and cm.calls == []
+
+
+@pytest.mark.parametrize("metadata", [
+    r'{name: "cm\nCluster: elsewhere", namespace: app}',
+    r'{name: cm, namespace: "app\nWrite profile: nobody"}',
+])
+def test_apply_names_that_could_spoof_the_prompt_are_refused(writable, metadata):
+    srv, dyn, *_ = writable
+    human = Approver()
+    doc = f"apiVersion: v1\nkind: ConfigMap\nmetadata: {metadata}\n"
+    msg = tool_error(srv, "apply_yaml", human, target="dev", yaml_content=doc)
+    assert "invalid" in msg
+    assert human.prompts == [] and dyn.applied == []
+
+
+def test_rbac_style_names_are_allowed(writable):
+    srv, dyn, *_ = writable
+    dyn.add(FakeResource("ClusterRole", namespaced=False, api_version="rbac.authorization.k8s.io/v1"))
+    result(srv, "manage_k8s_resource", Approver(), target="dev", operation="delete",
+           api_version="rbac.authorization.k8s.io/v1", kind="ClusterRole", name="system:aggregate-to-view")
+
+
+def test_prompt_shows_the_real_target_first_and_last(writable):
+    """Body text can contain anything (a data value may read 'Cluster: other'), so the
+    real target block closes the prompt too, right above the question."""
+    srv, *_ = writable
+    human = Approver()
     result(srv, "manage_k8s_resource", human, target="dev", operation="create", kind="ConfigMap", name="cm",
-           namespace="app", body=body)
-    assert len(human.prompts[0]) < 5000 and "more characters" in human.prompts[0]
-    assert cm.calls[0][1]["body"] == body  # truncation is for display only
+           namespace="app", body={**CM, "data": {"note": "Cluster: somewhere-else"}}, dry_run=True)
+    t = srv.registry.resolve("dev")
+    lines = human.prompts[0].splitlines()
+    assert lines[1].startswith(f"Cluster: {t.cluster_name}")
+    assert lines[-1] == "Approve this write?"
+    assert lines[-4].startswith(f"Cluster: {t.cluster_name}") and lines[-2] == f"Write profile: {t.write_profile}"
 
 
 def test_no_prompt_for_invalid_requests(writable):

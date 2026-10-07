@@ -144,6 +144,10 @@ class FakeDynamic:
 
         self.resources = _Resources()
 
+    def add(self, r: FakeResource) -> FakeResource:
+        self._by_key[(r.api_version, r.kind)] = r
+        return r
+
     def server_side_apply(self, res, body, name, namespace=None, **kw):
         self.applied.append({"kind": res.kind, "name": name, "namespace": namespace, **kw})
         return Obj({"metadata": {"name": name, "resourceVersion": "42"}})

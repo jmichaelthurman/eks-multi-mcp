@@ -7,6 +7,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
@@ -60,7 +61,14 @@ Multi-account, multi-cluster Amazon EKS server.
 
 MAX_ITEMS = 500
 SENSITIVE_KINDS = {"Secret"}
-PROMPT_DETAIL_CHARS = 4000
+PROMPT_DETAIL_CHARS = 6000  # larger writes are refused, never shown in part
+
+# Fields an agent supplies that land on their own lines in the approval prompt. They are
+# checked before prompting so a newline or space cannot forge a "Cluster:" line.
+_NAME = re.compile(r"[A-Za-z0-9]([-A-Za-z0-9._:]{0,251}[A-Za-z0-9])?")  # also RBAC's "system:..."
+_NAMESPACE = re.compile(r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?")  # DNS-1123 label
+_KIND = re.compile(r"[A-Za-z][A-Za-z0-9]{0,62}")
+_API_VERSION = re.compile(r"([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?v[0-9][a-z0-9]{0,15}")
 
 
 class WriteApproval(BaseModel):
@@ -141,15 +149,22 @@ class EksMultiServer:
         if self.is_protected(t):  # require_write already refused; never prompt for one
             raise ToolError(f"writes to protected env '{t.env}' are forbidden; {refused}")
         if len(detail) > PROMPT_DETAIL_CHARS:
-            detail = detail[:PROMPT_DETAIL_CHARS] + f"\n... ({len(detail) - PROMPT_DETAIL_CHARS} more characters)"
-        lines = [
-            f"{'DRY RUN (server-side, not persisted)' if dry_run else 'WRITE'}: {action}",
+            # The human must see everything they approve; a cut-off prompt can hide an object.
+            raise ToolError(f"this write is too large to show in full for approval ({len(detail)} characters, "
+                            f"limit {PROMPT_DETAIL_CHARS}); split it into smaller writes; {refused}")
+        where = [
             f"Cluster: {t.cluster_name}  ({t.region})",
             f"Account: {t.account_id} ({t.account_name or 'unnamed'})  env: {t.env or 'unknown'}",
             f"Write profile: {t.write_profile}",
+        ]
+        # The real target opens and closes the prompt: body text can say anything.
+        lines = [
+            f"{'DRY RUN (server-side, not persisted)' if dry_run else 'WRITE'}: {action}",
+            *where,
             "",
             detail,
             "",
+            *where,
             "Approve this write?",
         ]
         message = "\n".join(lines)
@@ -594,6 +609,8 @@ class EksMultiServer:
                 md = d.get("metadata") or {}
                 if not (d.get("apiVersion") and d.get("kind") and md.get("name")):
                     raise ToolError(f"document {i} needs apiVersion, kind and metadata.name")
+                _check_fields(f"document {i}: ", name=md["name"], namespace=md.get("namespace") or namespace,
+                              kind=d["kind"], api_version=d["apiVersion"])
                 res = self._resource(t, d["apiVersion"], d["kind"])
                 ns = _namespace(res, md.get("namespace") or namespace, f"document {i} ({d['kind']})")
                 plan.append((d, ns))
@@ -623,6 +640,7 @@ class EksMultiServer:
             protected envs (prd/prod/production) and when the env is unknown or guessed."""
             t = self.target(target)
             self.require_write(t)
+            _check_fields(name=name, namespace=namespace, kind=kind, api_version=api_version)
             ns = _namespace(self._resource(t, api_version, kind), namespace, kind)
             if operation != "delete" and body is None:
                 raise ToolError(f"'{operation}' needs a body")
@@ -785,6 +803,18 @@ def _k8s_error(e: Exception) -> str:
     hint = {401: " (token rejected: the IAM principal is not mapped to this cluster)",
             403: " (RBAC: the IAM principal lacks this permission)"}.get(status, "")
     return f"Kubernetes API {status} {reason}: {msg}{hint}".strip()
+
+
+def _check_fields(where: str = "", **fields: Any) -> None:
+    """Refuse agent-supplied identifiers that are not valid Kubernetes names, before any
+    prompt is shown. A value with a newline or space could otherwise forge prompt lines."""
+    rules = {"name": _NAME, "namespace": _NAMESPACE, "kind": _KIND, "api_version": _API_VERSION}
+    for field_name, value in fields.items():
+        if value is None and field_name == "namespace":
+            continue
+        if not (isinstance(value, str) and rules[field_name].fullmatch(value)):
+            raise ToolError(f"{where}invalid {field_name} {value!r}: not a valid Kubernetes "
+                            f"{field_name.replace('_', ' ')}; nothing was sent to the cluster")
 
 
 def _namespace(res, namespace: str | None, what: str) -> str | None:

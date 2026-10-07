@@ -74,10 +74,47 @@ def test_cli_flags_reach_settings(files, monkeypatch):
             self.mcp = type("M", (), {"run": lambda self, transport: seen.setdefault("transport", transport)})()
 
     monkeypatch.setattr("eks_multi_mcp.server.EksMultiServer", Srv)
-    cli.main(["--allow-write", "--allow-sensitive-data-access", "--no-kubeconfig", "--transport", "sse"])
+    cli.main(["--allow-write", "--allow-sensitive-data-access", "--no-kubeconfig"])
     s = seen["s"]
     assert s.allow_write and s.allow_sensitive_data_access and not s.use_kubeconfig
-    assert seen["transport"] == "sse"
+    assert seen["transport"] == "stdio"
+
+
+@pytest.mark.parametrize("transport", ["streamable-http", "sse"])
+@pytest.mark.parametrize("flags,config", [
+    (["--allow-write"], ""),
+    (["--allow-sensitive-data-access"], ""),
+    ([], "safety:\n  allow_write: true\n"),
+    ([], "safety:\n  allow_sensitive_data_access: true\n"),
+])
+def test_http_transports_refuse_write_and_sensitive_access(files, monkeypatch, tmp_path, transport, flags, config):
+    """HTTP has no authentication: any local process could connect, act as the MCP client
+    and answer its own approval prompts. So writes and sensitive reads are stdio-only,
+    whether enabled by flag or by config file."""
+    _cli_env(files, monkeypatch)
+    if config:
+        cfg = tmp_path / "cfg.yaml"
+        cfg.write_text(config)
+        flags = [*flags, "--config", str(cfg)]
+    started = []
+    monkeypatch.setattr("eks_multi_mcp.server.EksMultiServer", lambda s: started.append(s))
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["--transport", transport, "--no-kubeconfig", *flags])
+    assert "only over stdio" in str(ex.value) and started == []
+
+
+def test_http_transport_read_only_is_allowed(files, monkeypatch):
+    _cli_env(files, monkeypatch)
+    seen = {}
+
+    class Srv:
+        def __init__(self, settings):
+            seen["s"] = settings
+            self.mcp = type("M", (), {"run": lambda self, transport: seen.setdefault("transport", transport)})()
+
+    monkeypatch.setattr("eks_multi_mcp.server.EksMultiServer", Srv)
+    cli.main(["--transport", "streamable-http", "--no-kubeconfig"])
+    assert seen["transport"] == "streamable-http" and not seen["s"].allow_write
 
 
 def test_cli_default_is_read_only_stdio(files, monkeypatch):

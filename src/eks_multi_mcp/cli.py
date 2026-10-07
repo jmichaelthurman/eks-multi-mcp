@@ -23,7 +23,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--no-kubeconfig", action="store_true", help="use only the cluster map / AWS discovery")
     ap.add_argument("--selector", default=None, help="targets/doctor: target selector, e.g. env:prod")
     ap.add_argument("--no-access-check", action="store_true", help="doctor: skip AWS/Kubernetes calls")
-    ap.add_argument("--transport", default="stdio", choices=["stdio", "streamable-http", "sse"])
+    ap.add_argument("--transport", default="stdio", choices=["stdio", "streamable-http", "sse"],
+                    help="HTTP transports are unauthenticated, so they refuse writes and sensitive access")
     ap.add_argument("--log-level", default="WARNING")
     args = ap.parse_args(argv)
 
@@ -32,6 +33,12 @@ def main(argv: list[str] | None = None) -> None:
     settings.log_level = args.log_level.upper()
     settings.allow_write = settings.allow_write or args.allow_write
     settings.allow_sensitive_data_access = settings.allow_sensitive_data_access or args.allow_sensitive_data_access
+    if args.transport != "stdio" and (settings.allow_write or settings.allow_sensitive_data_access):
+        # The HTTP transports have no authentication: any local process can connect, act as
+        # the MCP client and answer its own approval prompts.
+        raise SystemExit(f"eks-multi-mcp: writes and sensitive data access are available only over stdio; "
+                         f"the {args.transport} transport has no client authentication. Drop --allow-write "
+                         "and --allow-sensitive-data-access (and their config settings), or use stdio.")
     if args.kubeconfig:
         settings.kubeconfig_paths = args.kubeconfig
     if args.no_kubeconfig:

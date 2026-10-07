@@ -62,6 +62,10 @@ Multi-account, multi-cluster Amazon EKS server.
 MAX_ITEMS = 500
 SENSITIVE_KINDS = {"Secret"}
 PROMPT_DETAIL_CHARS = 6000  # larger writes are refused, never shown in part
+# Request YAML sits between these markers with every line indented, so nothing in it can
+# start a line of the prompt and pass for the server's own text.
+REQUEST_YAML_BEGIN = "----- request YAML (as sent; every line indented) -----"
+REQUEST_YAML_END = "----- end of request YAML -----"
 
 # Fields an agent supplies that land on their own lines in the approval prompt. They are
 # checked before prompting so a newline or space cannot forge a "Cluster:" line.
@@ -129,7 +133,7 @@ class EksMultiServer:
         protected = {normalize_env(e) for e in self.settings.protected_envs}
         return normalize_env(t.env) in protected
 
-    def approve(self, ctx: Context, t: Target, action: str, detail: str, dry_run: bool) -> None:
+    def approve(self, ctx: Context, t: Target, action: str, body: str, dry_run: bool, objects: str = "") -> None:
         """Ask the human, through the MCP client, to approve one write. Called from a worker
         thread after require_write and validation, before anything uses the write profile. Fails closed:
         no prompt, no answer, or any answer but an explicit approval means no write.
@@ -148,6 +152,7 @@ class EksMultiServer:
 
         if self.is_protected(t):  # require_write already refused; never prompt for one
             raise ToolError(f"writes to protected env '{t.env}' are forbidden; {refused}")
+        detail = objects + body
         if len(detail) > PROMPT_DETAIL_CHARS:
             # The human must see everything they approve; a cut-off prompt can hide an object.
             raise ToolError(f"this write is too large to show in full for approval ({len(detail)} characters, "
@@ -157,13 +162,17 @@ class EksMultiServer:
             f"Account: {t.account_id} ({t.account_name or 'unnamed'})  env: {t.env or 'unknown'}",
             f"Write profile: {t.write_profile}",
         ]
+        request = []
+        if objects:
+            request += [objects, ""]
+        if body:
+            request += [REQUEST_YAML_BEGIN, *("    " + line for line in body.splitlines()), REQUEST_YAML_END, ""]
         # The real target opens and closes the prompt: body text can say anything.
         lines = [
             f"{'DRY RUN (server-side, not persisted)' if dry_run else 'WRITE'}: {action}",
             *where,
             "",
-            detail,
-            "",
+            *request,
             *where,
             "Approve this write?",
         ]
@@ -615,7 +624,7 @@ class EksMultiServer:
             objects = "\n".join(f"  {d['kind']} {(ns + '/') if ns else ''}{d['metadata']['name']}" for d, ns in plan)
             self.approve(ctx, t, f"server-side apply of {len(plan)} object(s)"
                          + (" with force_conflicts" if force_conflicts else ""),
-                         f"{objects}\n\n" + yaml.safe_dump_all([d for d, _ in plan], sort_keys=False), dry_run)
+                         yaml.safe_dump_all([d for d, _ in plan], sort_keys=False), dry_run, objects=objects)
             dyn = self.auth.dynamic(t, "write")
             results = []
             for d, ns in plan:
@@ -642,6 +651,8 @@ class EksMultiServer:
             ns = _namespace(self._resource(t, api_version, kind), namespace, kind)
             if operation != "delete" and body is None:
                 raise ToolError(f"'{operation}' needs a body")
+            if body is not None:
+                _check_body_matches(body, operation, api_version=api_version, kind=kind, name=name, namespace=ns)
             self.approve(ctx, t, f"{operation} {api_version} {kind} {(ns + '/') if ns else ''}{name}",
                          "" if body is None else yaml.safe_dump(body, sort_keys=False), dry_run)
             res = self._resource(t, api_version, kind, mode="write")
@@ -813,6 +824,23 @@ def _check_fields(where: str = "", **fields: Any) -> None:
         if not (isinstance(value, str) and rules[field_name].fullmatch(value)):
             raise ToolError(f"{where}invalid {field_name} {value!r}: not a valid Kubernetes "
                             f"{field_name.replace('_', ' ')}; nothing was sent to the cluster")
+
+
+def _check_body_matches(body: dict, operation: str, **args: str | None) -> None:
+    """The prompt's first line names what the arguments say, but the API server acts on the
+    body. Refuse any disagreement, so the human never approves one name while another is
+    written. create and replace must also name the object in the body."""
+    md = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    pairs = {"apiVersion": (body.get("apiVersion"), args["api_version"]),
+             "kind": (body.get("kind"), args["kind"]),
+             "metadata.name": (md.get("name"), args["name"]),
+             "metadata.namespace": (md.get("namespace"), args["namespace"])}
+    for field_name, (got, want) in pairs.items():
+        if got is None and not (field_name == "metadata.name" and operation in ("create", "replace")):
+            continue
+        if got != want:
+            raise ToolError(f"body {field_name} {got!r} does not match the requested {want!r}; "
+                            "nothing was sent to the cluster")
 
 
 def _namespace(res, namespace: str | None, what: str) -> str | None:

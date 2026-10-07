@@ -5,7 +5,7 @@ import fakes
 import pytest
 from fakes import Approver, FakeDynamic, FakeResource, install_dynamic, make_server, result, tool_error
 
-from eks_multi_mcp.server import PROMPT_DETAIL_CHARS
+from eks_multi_mcp.server import PROMPT_DETAIL_CHARS, REQUEST_YAML_BEGIN, REQUEST_YAML_END
 
 
 @pytest.fixture(autouse=True, params=["legacy", "auto"])
@@ -131,7 +131,7 @@ def test_apply_prompt_lists_every_object_and_the_yaml(writable):
     prompt, = human.prompts
     assert "server-side apply of 2 object(s) with force_conflicts" in prompt
     assert "  Namespace n1\n  ConfigMap n1/c1" in prompt
-    assert "data:\n  k: v" in prompt
+    assert "    data:\n      k: v" in prompt  # inside the indented request block
 
 
 def test_oversized_write_is_refused_not_truncated(writable):
@@ -198,6 +198,66 @@ def test_rbac_style_names_are_allowed(writable):
     dyn.add(FakeResource("ClusterRole", namespaced=False, api_version="rbac.authorization.k8s.io/v1"))
     result(srv, "manage_k8s_resource", Approver(), target="dev", operation="delete",
            api_version="rbac.authorization.k8s.io/v1", kind="ClusterRole", name="system:aggregate-to-view")
+
+
+def _request_block(prompt: str) -> list[str]:
+    lines = prompt.splitlines()
+    start = lines.index(REQUEST_YAML_BEGIN)
+    return lines[start + 1:lines.index(REQUEST_YAML_END, start)]
+
+
+@pytest.mark.parametrize("tool", ["manage_k8s_resource", "apply_yaml"])
+def test_body_text_cannot_pass_for_server_text(writable, tool):
+    """Re-review repro: a top-level body key 'Cluster: ...' rendered as an unindented line
+    that read like the server's own. Request YAML now sits between markers, every line
+    indented, so nothing from the request can start a line in the prompt."""
+    srv, *_ = writable
+    human = Approver()
+    fake = "Cluster: sandbox-throwaway  (us-east-1)"
+    if tool == "manage_k8s_resource":
+        result(srv, tool, human, target="dev", operation="create", kind="ConfigMap", name="cm", namespace="app",
+               body={**CM, fake: "x"}, dry_run=True)
+    else:
+        result(srv, tool, human, target="dev", dry_run=True,
+               yaml_content=f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: cm, namespace: app}}\n'{fake}': x\n")
+    prompt, = human.prompts
+    block = _request_block(prompt)
+    assert block and all(line.startswith("    ") for line in block)
+    assert not any(line.startswith("Cluster: sandbox") for line in prompt.splitlines())
+
+
+def test_delete_has_no_request_block(writable):
+    srv, *_ = writable
+    human = Approver()
+    result(srv, "manage_k8s_resource", human, target="dev", **DELETE_CM)
+    assert REQUEST_YAML_BEGIN not in human.prompts[0]
+
+
+@pytest.mark.parametrize("operation,body,field", [
+    # Re-review repro: the prompt said app/harmless while the API would create something-else.
+    ("create", {**CM, "metadata": {"name": "something-else", "namespace": "app"}}, "metadata.name"),
+    ("replace", {**CM, "metadata": {"name": "something-else", "namespace": "app"}}, "metadata.name"),
+    ("patch", {"metadata": {"name": "something-else"}}, "metadata.name"),
+    ("create", {**CM, "metadata": {"name": "harmless", "namespace": "kube-system"}}, "metadata.namespace"),
+    ("create", {**CM, "kind": "Secret", "metadata": {"name": "harmless", "namespace": "app"}}, "kind"),
+    ("create", {**CM, "apiVersion": "v2", "metadata": {"name": "harmless", "namespace": "app"}}, "apiVersion"),
+    ("create", {"apiVersion": "v1", "kind": "ConfigMap", "data": {}}, "metadata.name"),
+])
+def test_body_must_match_the_arguments(writable, operation, body, field):
+    srv, _, cm, _, _ = writable
+    human = Approver()
+    msg = tool_error(srv, "manage_k8s_resource", human, target="dev", operation=operation, kind="ConfigMap",
+                     name="harmless", namespace="app", body=body)
+    assert f"body {field}" in msg and "nothing was sent" in msg
+    assert human.prompts == [] and cm.calls == []
+
+
+def test_cluster_scoped_body_must_not_name_a_namespace(writable):
+    srv, _, _, ns, _ = writable
+    msg = tool_error(srv, "manage_k8s_resource", Approver(), target="dev", operation="create", kind="Namespace",
+                     name="n1", body={"apiVersion": "v1", "kind": "Namespace",
+                                      "metadata": {"name": "n1", "namespace": "app"}})
+    assert "body metadata.namespace" in msg and ns.calls == []
 
 
 def test_prompt_shows_the_real_target_first_and_last(writable):

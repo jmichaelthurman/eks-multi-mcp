@@ -60,7 +60,9 @@ That makes it immune to the usual kubeconfig traps, and `doctor` reports each on
   can't supply the approval.
 - **The prompt is never partial or forged.** A write too large to show in full is refused,
   not cut off. Names, namespaces, kinds and API versions must be valid Kubernetes names, so
-  they can't smuggle in fake prompt lines.
+  they can't smuggle in fake prompt lines. The request's YAML sits between markers with
+  every line indented, so it can't pass for the server's own text, and a body whose kind,
+  API version, name or namespace disagrees with the operation shown is refused.
 - **Fails closed.** If the client can't show an elicitation prompt, or the user declines,
   cancels, or answers anything else, nothing is sent to the cluster.
 - Approval is only as good as the client: use a client that shows elicitation prompts to

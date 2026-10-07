@@ -13,6 +13,9 @@ from typing import Any
 
 import yaml
 
+# Writes to these envs are always forbidden; config can add envs to the list, never remove these.
+ALWAYS_PROTECTED_ENVS = ("prd", "prod", "production")
+
 DEFAULT_CONFIG_PATHS = (
     "~/.config/eks-multi-mcp/config.yaml",
     "~/.eks-multi-mcp.yaml",
@@ -66,7 +69,7 @@ class Settings:
     # Safety policy.
     allow_write: bool = False
     allow_sensitive_data_access: bool = False
-    protected_envs: list[str] = field(default_factory=lambda: ["prd", "prod", "production"])
+    protected_envs: list[str] = field(default_factory=lambda: list(ALWAYS_PROTECTED_ENVS))
     exclude_contexts: list[str] = field(default_factory=list)  # glob patterns
 
     accounts: dict[str, AccountSettings] = field(default_factory=dict)
@@ -132,7 +135,8 @@ def settings_from_dict(raw: dict[str, Any], source: str | None = None) -> Settin
     s.allow_sensitive_data_access = bool(
         safety.get("allow_sensitive_data_access", s.allow_sensitive_data_access)
     )
-    s.protected_envs = [e.lower() for e in safety.get("protected_envs", s.protected_envs)]
+    configured = [str(e).lower() for e in safety.get("protected_envs") or []]
+    s.protected_envs = list(dict.fromkeys([*ALWAYS_PROTECTED_ENVS, *configured]))
 
     for acct_id, a in (raw.get("accounts", {}) or {}).items():
         a = a or {}

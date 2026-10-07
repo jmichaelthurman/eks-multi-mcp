@@ -37,10 +37,11 @@ Multi-account, multi-cluster Amazon EKS server.
   rely on the answer, especially when comparing environments.
 - Fleet tools (`fleet_*`) take a selector such as `env:dev`, `account:team-*`,
   `web-*`, or `*`.
-- Reads use each account's read profile; writes use its write profile. Every write,
-  dry runs included, pauses for a human to approve it in the MCP client; in a
-  protected environment (prod by default) the human must type the cluster name.
-  Clients that cannot show that prompt cannot write.
+- Reads use each account's read profile; writes use its write profile.
+- Writes to a protected environment (always prd/prod/production) or to a target whose
+  environment is unknown are forbidden; there is no way to approve them.
+- Every other write, dry runs included, pauses for a human to approve it in the MCP
+  client. Clients that cannot show that prompt cannot write.
 - Run `doctor` when access fails: it pinpoints expired SSO, stale kube contexts and
   exec blocks pointed at the wrong account.
 """
@@ -52,10 +53,6 @@ PROMPT_DETAIL_CHARS = 4000
 
 class WriteApproval(BaseModel):
     approve: bool = Field(description="Approve this write")
-
-
-class ProtectedWriteApproval(BaseModel):
-    cluster_name: str = Field(description="Type the cluster name to approve this write")
 
 
 class EksMultiServer:
@@ -81,18 +78,25 @@ class EksMultiServer:
             )
 
     def require_write(self, t: Target) -> None:
+        """Hard gates, checked before any client is built or any prompt is shown."""
         if not self.settings.allow_write:
             raise ToolError("the server is read-only; restart it with --allow-write to enable writes")
         if t.read_only:
             raise ToolError(f"target '{t.alias}' is marked read_only in the cluster map")
+        if not t.env:
+            raise ToolError(f"writes to '{t.alias}' are forbidden: its environment is unknown, so it "
+                            "could be production (set env for its account in the cluster map)")
+        if self.is_protected(t):
+            raise ToolError(f"writes to '{t.alias}' are forbidden: env '{t.env}' (account {t.account_id}) "
+                            "is protected, and this server never writes to protected environments")
 
     def is_protected(self, t: Target) -> bool:
         protected = {normalize_env(e) for e in self.settings.protected_envs}
-        return bool(t.env) and normalize_env(t.env) in protected
+        return normalize_env(t.env) in protected
 
     def approve(self, ctx: Context, t: Target, action: str, detail: str, dry_run: bool) -> None:
         """Ask the human, through the MCP client, to approve one write. Called from a worker
-        thread after validation and before anything uses the write profile. Fails closed:
+        thread after require_write and validation, before anything uses the write profile. Fails closed:
         no prompt, no answer, or any answer but an explicit approval means no write.
 
         The calling agent never supplies the approval itself; it comes back from the client's
@@ -107,7 +111,8 @@ class EksMultiServer:
             raise ToolError("writes need a human to approve them, but this MCP client cannot show an "
                             f"approval prompt (no elicitation support); {refused}")
 
-        protected = self.is_protected(t)
+        if self.is_protected(t):  # require_write already refused; never prompt for one
+            raise ToolError(f"writes to protected env '{t.env}' are forbidden; {refused}")
         if len(detail) > PROMPT_DETAIL_CHARS:
             detail = detail[:PROMPT_DETAIL_CHARS] + f"\n... ({len(detail) - PROMPT_DETAIL_CHARS} more characters)"
         lines = [
@@ -118,21 +123,17 @@ class EksMultiServer:
             "",
             detail,
             "",
-            (f"PROTECTED ENVIRONMENT. Type the cluster name '{t.cluster_name}' to approve."
-             if protected else "Approve this write?"),
+            "Approve this write?",
         ]
-        schema = ProtectedWriteApproval if protected else WriteApproval
         try:
-            answer = anyio.from_thread.run(ctx.elicit, "\n".join(lines), schema)
+            answer = anyio.from_thread.run(ctx.elicit, "\n".join(lines), WriteApproval)
         except NoBackChannelError as e:
             raise ToolError(f"this MCP connection cannot show an approval prompt; {refused}") from e
         except ValueError as e:
             raise ToolError(f"the approval response was malformed; {refused}") from e
         if answer.action != "accept":
             raise ToolError(f"the write was not approved ({answer.action}); {refused}")
-        if protected and answer.data.cluster_name != t.cluster_name:
-            raise ToolError(f"the typed cluster name did not match '{t.cluster_name}'; {refused}")
-        if not protected and answer.data.approve is not True:
+        if answer.data.approve is not True:
             raise ToolError(f"the write was not approved; {refused}")
         log.warning("write approved by user: %s on %s (%s)", action, t.cluster_name, t.account_id)
 
@@ -291,7 +292,8 @@ class EksMultiServer:
 
         @tool
         def reload_config() -> dict:
-            """Re-read the config file, kubeconfig and ~/.aws/config, and drop cached clients."""
+            """Re-read kubeconfig and ~/.aws/config, and drop cached clients. The config file
+            (cluster map and safety policy) is read only at startup; restart to change it."""
             self.registry.reload()
             self.auth.invalidate()
             return {"targets": len(self.registry.targets)}
@@ -509,8 +511,8 @@ class EksMultiServer:
         def apply_yaml(ctx: Context, target: str, yaml_content: str, namespace: str | None = None,
                        dry_run: bool = False, force_conflicts: bool = False) -> dict:
             """Server-side apply one or more YAML documents, authenticated with the target's
-            write profile. Requires --allow-write, and a human must approve the write in the
-            MCP client (in protected envs, by typing the cluster name)."""
+            write profile. Requires --allow-write and a human's approval in the MCP client.
+            Forbidden in protected envs (prd/prod/production) and when the env is unknown."""
             t = self.target(target)
             self.require_write(t)
             try:
@@ -553,8 +555,8 @@ class EksMultiServer:
                                 kind: str, name: str, api_version: str = "v1", namespace: str | None = None,
                                 body: dict | None = None, dry_run: bool = False) -> dict:
             """Create, replace, merge-patch or delete one resource with the target's write profile.
-            Requires --allow-write, and a human must approve the write in the MCP client (in
-            protected envs, by typing the cluster name)."""
+            Requires --allow-write and a human's approval in the MCP client. Forbidden in
+            protected envs (prd/prod/production) and when the env is unknown."""
             t = self.target(target)
             self.require_write(t)
             ns = _namespace(self._resource(t, api_version, kind), namespace, kind)

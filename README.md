@@ -44,16 +44,21 @@ That makes it immune to the usual kubeconfig traps, and `doctor` reports each on
 
 - **Read-only by default.** Write tools (`apply_yaml`, `manage_k8s_resource`) need `--allow-write`.
 - Writes use the target's **write profile**; reads always use the **read profile**.
-- **Every write needs a human to approve it, dry runs included.** Before anything uses the
-  write profile, the server sends an MCP elicitation prompt to the client. The prompt shows
-  the cluster, account, env, write profile, operation and the full YAML or body, and the
-  write goes ahead only if the user approves. The calling agent can't supply the approval.
-- In a protected env (`safety.protected_envs`, default `prd`, `prod`, `production`), the user
-  must **type the cluster name** into that prompt; an alias doesn't count.
+- **Writes to production are forbidden outright.** Protected envs are always `prd`, `prod` and
+  `production`; `safety.protected_envs` can add more but never remove those. A target whose env
+  is unknown is treated as protected. These writes are refused before any client is built or
+  any prompt is shown, and nothing can approve them.
+- **Every other write needs a human to approve it, dry runs included.** Before anything uses
+  the write profile, the server sends an MCP elicitation prompt to the client. The prompt shows
+  the cluster, account, env, write profile, operation and the full YAML or body, and the write
+  goes ahead only if the user approves. The calling agent can't supply the approval.
 - **Fails closed.** If the client can't show an elicitation prompt, or the user declines,
   cancels, or answers anything else, nothing is sent to the cluster.
 - Approval is only as good as the client: use a client that shows elicitation prompts to
-  you, never one that answers them automatically.
+  you, never one that answers them automatically. Production doesn't depend on this; it is
+  never writable.
+- The config file, including the safety policy, is read only at startup; `reload_config`
+  re-reads kubeconfig and `~/.aws/config` only.
 - `read_only: true` on an account or cluster in the map overrides `--allow-write`.
 - Pod logs, CloudWatch logs and Secret values need `--allow-sensitive-data-access`.
   Without it, Secrets come back with their values redacted.
@@ -129,7 +134,7 @@ uv run eks-multi-mcp serve                 # stdio MCP server (default command)
 
 ```bash
 claude mcp add eks-multi -- uv run --directory /path/to/eks-multi-mcp eks-multi-mcp
-# with writes enabled (each write still asks you to approve it):
+# with writes enabled (non-prod only; each write still asks you to approve it):
 claude mcp add eks-multi-rw -- uv run --directory /path/to/eks-multi-mcp eks-multi-mcp --allow-write
 ```
 

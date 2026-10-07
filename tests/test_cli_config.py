@@ -18,7 +18,8 @@ def test_load_settings_from_env_var(tmp_path, monkeypatch):
     cfg.write_text("safety:\n  allow_write: true\n  protected_envs: [Live]\n")
     monkeypatch.setenv("EKS_MULTI_MCP_CONFIG", str(cfg))
     s = load_settings()
-    assert s.source_path == str(cfg) and s.allow_write is True and s.protected_envs == ["live"]
+    assert s.source_path == str(cfg) and s.allow_write is True
+    assert s.protected_envs == ["prd", "prod", "production", "live"]
 
 
 def test_defaults_are_safe(tmp_path):

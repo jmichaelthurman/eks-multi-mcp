@@ -7,7 +7,7 @@
 Every write is a server-side dry run, followed by a read proving nothing persisted, and
 each one is shown to you on the terminal and sent only if you approve it there; without a
 terminal (no -s, or CI) the write checks skip. The protected target only ever receives
-approval answers that must be refused, and the write profile is never used against it.
+write calls the server must refuse before building a client or showing a prompt.
 Skipped entirely when EKS_MULTI_MCP_LIVE_TARGET is unset.
 """
 
@@ -162,28 +162,24 @@ def test_manage_dry_run_persists_nothing(srv, human, op):
 
 
 @pytest.mark.skipif(not PROTECTED, reason="set EKS_MULTI_MCP_LIVE_PROTECTED_TARGET to check the prod gate")
-@pytest.mark.parametrize("reply", ["no-prompt", "decline", {"approve": True}, {"cluster_name": "wrong-cluster"},
-                                   "alias"])
-def test_protected_target_refuses_without_the_typed_cluster_name(srv, monkeypatch, reply):
-    t = srv.registry.resolve(PROTECTED)
-    if reply == "alias":
-        if PROTECTED == t.cluster_name:
-            pytest.skip("the protected target was given by its cluster name; alias check not applicable")
-        reply = {"cluster_name": PROTECTED}
-    read_client = srv.auth.dynamic
+@pytest.mark.parametrize("tool,args", [
+    ("manage_k8s_resource", {"operation": "delete", "kind": "ConfigMap", "name": PROBE, "namespace": NS}),
+    ("apply_yaml", {"yaml_content": f"apiVersion: v1\nkind: ConfigMap\nmetadata: {{name: {PROBE}, "
+                                    f"namespace: {NS}}}\n"}),
+])
+def test_protected_target_is_never_written(srv, monkeypatch, tool, args):
+    """Even with a client that approves everything, prod is refused before any client is
+    built, any prompt is shown, or any request is sent."""
 
-    def read_only(target, mode="read"):
-        if mode != "read":
-            raise AssertionError("the write profile was used before approval")
-        return read_client(target, mode)
+    def no_clients(*a, **k):
+        raise AssertionError("a Kubernetes client was built for a protected target")
 
-    monkeypatch.setattr(srv.auth, "dynamic", read_only)
-    human = None if reply == "no-prompt" else Approver(reply)
-    msg = tool_error(srv, "manage_k8s_resource", human, target=PROTECTED, operation="delete", kind="ConfigMap",
-                     name=PROBE, namespace=NS, dry_run=True)
-    assert "nothing was sent" in msg
-    if human:
-        assert f"Type the cluster name '{t.cluster_name}'" in human.prompts[0]
+    monkeypatch.setattr(srv.auth, "dynamic", no_clients)
+    monkeypatch.setattr(srv.auth, "api_client", no_clients)
+    rubber_stamp = Approver()
+    msg = tool_error(srv, tool, rubber_stamp, target=PROTECTED, dry_run=True, **args)
+    assert "forbidden" in msg and "is protected" in msg
+    assert rubber_stamp.prompts == []
 
 
 def test_unknown_target_lists_suggestions(srv):

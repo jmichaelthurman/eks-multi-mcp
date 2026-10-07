@@ -44,13 +44,13 @@ def test_agent_supplied_confirmation_cannot_replace_the_human(writable):
     asked, and their refusal stands."""
     srv, _, cm, _, _ = writable
     human = Approver("decline")
-    msg = tool_error(srv, "manage_k8s_resource", human, target="prod-blue", confirm_cluster="web-prod-blue",
+    msg = tool_error(srv, "manage_k8s_resource", human, target="dev", confirm_cluster="web-dev-blue",
                      **DELETE_CM)
     assert "not approved" in msg and len(human.prompts) == 1 and cm.calls == []
 
 
 # ------------------------------------------------------------------ human approval
-@pytest.mark.parametrize("target", ["dev", "prod-blue"])
+@pytest.mark.parametrize("target", ["dev", "dev-main"])
 @pytest.mark.parametrize("dry_run", [True, False])
 def test_client_without_prompt_support_cannot_write(writable, target, dry_run):
     srv, _, cm, _, modes = writable
@@ -138,56 +138,70 @@ def test_no_prompt_for_invalid_requests(writable):
 
 
 # ------------------------------------------------------------------ protected environments
-@pytest.mark.parametrize("typed", ["", "prod-blue", "web-prod-blue ", "WEB-PROD-BLUE", "web-prod"])
-def test_protected_env_needs_the_exact_cluster_name_typed(writable, typed):
-    srv, _, cm, _, modes = writable
-    human = Approver({"cluster_name": typed})
-    msg = tool_error(srv, "manage_k8s_resource", human, target="prod-blue", dry_run=True, **DELETE_CM)
-    assert "did not match 'web-prod-blue'" in msg and "nothing was sent" in msg
-    assert cm.calls == [] and "write" not in modes
+@pytest.mark.parametrize("tool,args", [
+    ("apply_yaml", {"yaml_content": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: cm, namespace: app}\n"}),
+    ("manage_k8s_resource", DELETE_CM),
+])
+@pytest.mark.parametrize("dry_run", [True, False])
+@pytest.mark.parametrize("human", [None, "approve", {"approve": True}, {"cluster_name": "web-prod-blue"}])
+def test_protected_env_writes_are_forbidden_outright(writable, tool, args, dry_run, human):
+    """No answer unlocks prod: refused before any client is built or any prompt is shown."""
+    srv, dyn, cm, _, modes = writable
+    approver = Approver(human) if human else None
+    msg = tool_error(srv, tool, approver, target="prod-blue", dry_run=dry_run, **args)
+    assert "writes to 'web-prod-blue' are forbidden" in msg and "is protected" in msg
+    assert modes == [] and cm.calls == [] and dyn.applied == []
+    assert approver is None or approver.prompts == []
 
 
-def test_protected_env_asks_for_the_name_not_a_yes(writable):
-    srv, _, cm, _, _ = writable
-    msg = tool_error(srv, "manage_k8s_resource", Approver({"approve": True}), target="prod-blue", **DELETE_CM)
-    assert "malformed" in msg and cm.calls == []
-
-
-def test_protected_env_proceeds_when_name_typed(writable):
-    srv, _, cm, _, modes = writable
-    human = Approver()
-    out = result(srv, "manage_k8s_resource", human, target="prod-blue", dry_run=True, **DELETE_CM)
-    assert out["_target"]["cluster"] == "web-prod-blue"
-    assert "PROTECTED ENVIRONMENT. Type the cluster name 'web-prod-blue' to approve." in human.prompts[0]
-    assert human.schemas[0]["required"] == ["cluster_name"]
-    assert cm.calls == [("delete", {"name": "cm", "namespace": "app", "dry_run": "All"})]
-    assert_write_profile_only_after_approval(modes)
-
-
-@pytest.mark.parametrize("target", ["shop", "prod-blue", "333333333333/web-prod-blue"])
-def test_protected_env_rejects_aliases_typed_as_the_name(files, monkeypatch, target):
-    """The typed name must be the real cluster name, never an alias that resolved to it."""
+@pytest.mark.parametrize("target", ["shop", "prod-blue", "333333333333/web-prod-blue", "web-prod-blue"])
+def test_protected_env_forbidden_by_every_name(files, monkeypatch, target):
     srv = make_server(files, safety={"allow_write": True},
                       clusters=[{"cluster_name": "web-prod-blue", "region": "us-east-1",
                                  "account_id": "333333333333", "alias": "shop"}])
-    assert srv.registry.resolve(target).cluster_name == "web-prod-blue"
+    modes = install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
+    assert "forbidden" in tool_error(srv, "manage_k8s_resource", Approver(), target=target, **DELETE_CM)
+    assert modes == []
+
+
+@pytest.mark.parametrize("env", ["prd", "prod", "PRD", "production", "Prod"])
+@pytest.mark.parametrize("configured", [None, [], ["prod"], ["prd"], ["stg"]])
+def test_production_cannot_be_unprotected_by_config(files, monkeypatch, env, configured):
+    """Regression (spellings) and policy: config may add protected envs, never remove prod."""
+    safety = {"allow_write": True}
+    if configured is not None:
+        safety["protected_envs"] = configured
+    srv = make_server(files, safety=safety, accounts={"111111111111": {"env": env}})
+    modes = install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
+    human = Approver()
+    assert "is protected" in tool_error(srv, "manage_k8s_resource", human, target="dev", **DELETE_CM)
+    assert modes == [] and human.prompts == []
+
+
+def test_config_can_protect_more_envs(files, monkeypatch):
+    srv = make_server(files, safety={"allow_write": True, "protected_envs": ["dev"]})
+    install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
+    assert "env 'dev'" in tool_error(srv, "manage_k8s_resource", Approver(), target="dev", **DELETE_CM)
+
+
+def test_unknown_env_is_forbidden(files, monkeypatch):
+    """A target whose env can't be determined might be production, so it is treated as one."""
+    srv = make_server(files, safety={"allow_write": True})
+    t = srv.registry.resolve("ops-main")
+    assert t.env is None
+    modes = install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
+    human = Approver()
+    msg = tool_error(srv, "manage_k8s_resource", human, target="ops-main", **DELETE_CM)
+    assert "environment is unknown" in msg
+    assert modes == [] and human.prompts == []
+
+
+def test_unknown_env_writable_once_env_is_set(files, monkeypatch):
+    srv = make_server(files, safety={"allow_write": True}, accounts={"444444444444": {"env": "sandbox"}})
     cm = FakeResource("ConfigMap")
     install_dynamic(monkeypatch, srv, FakeDynamic(cm))
-    msg = tool_error(srv, "manage_k8s_resource", Approver({"cluster_name": target}), target=target, **DELETE_CM)
-    assert "did not match" in msg and cm.calls == []
-
-
-@pytest.mark.parametrize("env,protected", [
-    ("prd", ["prod"]), ("prod", ["prd"]), ("PRD", ["prod"]), ("production", ["prd"]), ("Prod", ["PROD"]),
-])
-def test_protected_env_matches_across_spellings(files, monkeypatch, env, protected):
-    """Regression: an explicit `env: prd` slipped past `protected_envs: [prod]`."""
-    srv = make_server(files, safety={"allow_write": True, "protected_envs": protected},
-                      accounts={"111111111111": {"env": env}})
-    install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
-    human = Approver({"approve": True})
-    assert "malformed" in tool_error(srv, "manage_k8s_resource", human, target="dev", **DELETE_CM)
-    assert "PROTECTED ENVIRONMENT" in human.prompts[0]
+    result(srv, "manage_k8s_resource", Approver(), target="ops-main", **DELETE_CM)
+    assert cm.calls[0][0] == "delete"
 
 
 def test_account_read_only_beats_allow_write(files, monkeypatch):
@@ -336,3 +350,20 @@ def test_apply_invalid_yaml_is_a_tool_error(writable):
     srv, dyn, *_ = writable
     tool_error(srv, "apply_yaml", Approver(), target="dev", yaml_content="a: [unclosed")
     assert dyn.applied == []
+
+
+def test_approval_prompt_is_never_shown_for_a_protected_target(files):
+    """Backstop: even if a future tool forgets require_write, approve() refuses prod and never
+    puts a prod write in front of the human."""
+    from types import SimpleNamespace
+
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    srv = make_server(files, safety={"allow_write": True})
+
+    def elicit(*a, **k):
+        raise AssertionError("prompted for a protected target")
+
+    ctx = SimpleNamespace(session=SimpleNamespace(check_client_capability=lambda cap: True), elicit=elicit)
+    with pytest.raises(ToolError, match="protected env 'prod' are forbidden"):
+        srv.approve(ctx, srv.registry.resolve("prod-blue"), "delete v1 ConfigMap app/cm", "", True)

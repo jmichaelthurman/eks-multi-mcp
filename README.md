@@ -27,7 +27,9 @@ for that cluster wins.
 
 A cluster's **env** comes from the map (cluster, then account). Otherwise it is inferred
 from a `dev` / `stg` / `prod` token in the cluster, account or profile name; `prd` and
-`production` normalize to `prod`, `staging` to `stg`.
+`production` normalize to `prod`, `staging` to `stg`. An inferred env is used for display,
+selectors and protection, but it never makes a cluster writable: set `env` in the map for
+every account you want to write to.
 
 ### Why it never runs your kubeconfig exec blocks
 
@@ -46,12 +48,19 @@ That makes it immune to the usual kubeconfig traps, and `doctor` reports each on
 - Writes use the target's **write profile**; reads always use the **read profile**.
 - **Writes to production are forbidden outright.** Protected envs are always `prd`, `prod` and
   `production`; `safety.protected_envs` can add more but never remove those. A target whose env
-  is unknown is treated as protected. These writes are refused before any client is built or
-  any prompt is shown, and nothing can approve them.
+  is unknown, or only inferred from its name, is treated as protected (a name can say `dev`
+  in a production account). These writes are refused before any client is built or any
+  prompt is shown, and nothing can approve them.
 - **Every other write needs a human to approve it, dry runs included.** Before anything uses
-  the write profile, the server sends an MCP elicitation prompt to the client. The prompt shows
-  the cluster, account, env, write profile, operation and the full YAML or body, and the write
-  goes ahead only if the user approves. The calling agent can't supply the approval.
+  the write profile, the server asks the client to show an MCP elicitation prompt: mid-call on
+  older protocol versions, or as an input-required round trip on 2026-07-28 (what Claude Code
+  speaks), where the echoed state is sealed and bound to the exact write and prompt. The prompt
+  shows the operation, the full YAML or body, and the cluster, account, env and write profile
+  both before and after it. The write goes ahead only if the user approves; the calling agent
+  can't supply the approval.
+- **The prompt is never partial or forged.** A write too large to show in full is refused,
+  not cut off. Names, namespaces, kinds and API versions must be valid Kubernetes names, so
+  they can't smuggle in fake prompt lines.
 - **Fails closed.** If the client can't show an elicitation prompt, or the user declines,
   cancels, or answers anything else, nothing is sent to the cluster.
 - Approval is only as good as the client: use a client that shows elicitation prompts to
@@ -61,7 +70,12 @@ That makes it immune to the usual kubeconfig traps, and `doctor` reports each on
   re-reads kubeconfig and `~/.aws/config` only.
 - `read_only: true` on an account or cluster in the map overrides `--allow-write`.
 - Pod logs, CloudWatch logs and Secret values need `--allow-sensitive-data-access`.
-  Without it, Secrets come back with their values redacted.
+  Without it, a Secret comes back as an allowlist only (name, namespace, labels, type and
+  key names); annotations such as `last-applied-configuration`, which carry the values, are
+  dropped.
+- **Writes and sensitive access are stdio-only.** The HTTP transports have no client
+  authentication, so any local process could connect and answer its own approval prompts.
+  The server refuses to start with `--allow-write` or `--allow-sensitive-data-access` on them.
 - **No default target.** Every response carries a `_target` stamp (account, cluster,
   profile, mode), so an answer can't silently come from the wrong account.
 
@@ -127,7 +141,7 @@ uv run eks-multi-mcp serve                 # stdio MCP server (default command)
 | `--no-kubeconfig` | Use only the cluster map and AWS discovery. |
 | `--selector SEL` | `targets` / `doctor`: limit to matching targets, e.g. `env:prod`. |
 | `--no-access-check` | `doctor`: static checks only, no AWS or Kubernetes calls. |
-| `--transport` | `stdio` (default), `streamable-http` or `sse`. |
+| `--transport` | `stdio` (default), `streamable-http` or `sse`. The HTTP transports are unauthenticated and refuse writes and sensitive access. |
 | `--log-level` | Server log level (default `WARNING`; logs go to stderr). |
 
 ### Claude Code
@@ -176,11 +190,12 @@ The offline suite replaces boto3 and the Kubernetes client with in-memory double
 
 `tests/test_live.py` is an opt-in end-to-end run against real clusters with your own
 config and SSO sessions. Every write in it is a server-side dry run followed by a read
-proving nothing persisted. The protected target only receives calls the gate must refuse
-before any request is sent.
+proving nothing persisted, and each one asks you to approve it on the terminal (run it from
+a real terminal, with `-s`; without one the write checks skip). The protected target only
+receives calls the gate must refuse before any request is sent.
 
 ```bash
 EKS_MULTI_MCP_LIVE_TARGET=<non-prod target> \
 EKS_MULTI_MCP_LIVE_PROTECTED_TARGET=<prod target> \
-uv run --group dev pytest -m live -v
+uv run --group dev pytest -m live -v -s
 ```

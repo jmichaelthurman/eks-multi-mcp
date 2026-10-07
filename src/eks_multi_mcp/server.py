@@ -4,6 +4,7 @@ cluster, so an answer can never silently come from the wrong account."""
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import time
@@ -16,11 +17,21 @@ import yaml
 from botocore.exceptions import BotoCoreError, ClientError
 from kubernetes.client.exceptions import ApiException
 from kubernetes.dynamic.exceptions import DynamicApiError, ResourceNotFoundError
+from mcp.server.elicitation import render_elicitation_schema
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.shared.exceptions import NoBackChannelError
-from mcp_types import ClientCapabilities, ElicitationCapability, ToolAnnotations
-from pydantic import BaseModel, Field
+from mcp_types import (
+    ClientCapabilities,
+    ElicitationCapability,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    ElicitResult,
+    InputRequiredResult,
+    ToolAnnotations,
+)
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+from pydantic import BaseModel, Field, ValidationError
 
 from .auth import AuthManager, CredentialError, explain_aws_error
 from .config import Settings
@@ -53,6 +64,18 @@ PROMPT_DETAIL_CHARS = 4000
 
 class WriteApproval(BaseModel):
     approve: bool = Field(description="Approve this write")
+
+
+APPROVAL_KEY = "approve"
+
+
+class _AskForApproval(Exception):
+    """Raised from a write tool's worker thread on a 2026-07-28 connection: the tool
+    returns `result` (an InputRequiredResult) and the client retries with the answer."""
+
+    def __init__(self, result: InputRequiredResult):
+        super().__init__("approval required")
+        self.result = result
 
 
 class EksMultiServer:
@@ -125,17 +148,51 @@ class EksMultiServer:
             "",
             "Approve this write?",
         ]
-        try:
-            answer = anyio.from_thread.run(ctx.elicit, "\n".join(lines), WriteApproval)
-        except NoBackChannelError as e:
-            raise ToolError(f"this MCP connection cannot show an approval prompt; {refused}") from e
-        except ValueError as e:
-            raise ToolError(f"the approval response was malformed; {refused}") from e
+        message = "\n".join(lines)
+        if ctx.protocol_version in MODERN_PROTOCOL_VERSIONS:
+            self._approve_by_round_trip(ctx, message, refused)
+        else:
+            try:
+                answer = anyio.from_thread.run(ctx.elicit, message, WriteApproval)
+            except NoBackChannelError as e:
+                raise ToolError(f"this MCP connection cannot show an approval prompt; {refused}") from e
+            except ValueError as e:
+                raise ToolError(f"the approval response was malformed; {refused}") from e
+            if answer.action != "accept":
+                raise ToolError(f"the write was not approved ({answer.action}); {refused}")
+            if answer.data.approve is not True:
+                raise ToolError(f"the write was not approved; {refused}")
+        log.warning("write approved by user: %s on %s (%s)", action, t.cluster_name, t.account_id)
+
+    @staticmethod
+    def _approve_by_round_trip(ctx: Context, message: str, refused: str) -> None:
+        """2026-07-28 approval. The server cannot send elicitation/create mid-call, so the
+        first round returns the prompt as an InputRequiredResult; the client shows it, then
+        retries the same call with the human's answer.
+
+        request_state carries a digest of the exact prompt. The SDK seals it (AES-GCM under
+        a per-process key, bound to this tool and these arguments, 10-minute TTL), so the
+        client can neither forge nor replay it, and the digest makes the retry fail if the
+        target now resolves differently (e.g. after reload_config) from what was shown."""
+        digest = "approval:v1:" + hashlib.sha256(message.encode()).hexdigest()
+        state, responses = ctx.request_state, ctx.input_responses or {}
+        if state is None or APPROVAL_KEY not in responses:
+            prompt = ElicitRequest(params=ElicitRequestFormParams(
+                message=message, requested_schema=render_elicitation_schema(WriteApproval)))
+            raise _AskForApproval(InputRequiredResult(input_requests={APPROVAL_KEY: prompt}, request_state=digest))
+        if state != digest:
+            raise ToolError(f"the write no longer matches the one that was approved; {refused}")
+        answer = responses[APPROVAL_KEY]
+        if not isinstance(answer, ElicitResult):
+            raise ToolError(f"the approval response was malformed; {refused}")
         if answer.action != "accept":
             raise ToolError(f"the write was not approved ({answer.action}); {refused}")
-        if answer.data.approve is not True:
+        try:
+            approved = WriteApproval.model_validate(answer.content or {}).approve
+        except ValidationError as e:
+            raise ToolError(f"the approval response was malformed; {refused}") from e
+        if approved is not True:
             raise ToolError(f"the write was not approved; {refused}")
-        log.warning("write approved by user: %s on %s (%s)", action, t.cluster_name, t.account_id)
 
     @staticmethod
     def wrap(t: Target, data: Any, mode: str = "read", **extra) -> dict:
@@ -167,7 +224,10 @@ class EksMultiServer:
                     except (BotoCoreError, ClientError) as e:
                         raise ToolError(explain_aws_error(e, None)) from e
 
-                return await anyio.to_thread.run_sync(call)
+                try:
+                    return await anyio.to_thread.run_sync(call)
+                except _AskForApproval as ask:
+                    return ask.result
 
             return mcp.tool(annotations=mutating if write else read_only)(runner)
 

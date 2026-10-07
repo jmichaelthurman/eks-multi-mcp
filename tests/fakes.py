@@ -49,6 +49,12 @@ class Approver:
         return types.ElicitResult(action="accept", content={"approve": True})
 
 
+# Protocol the test client speaks. "legacy" runs the initialize handshake, where the server
+# can send elicitation/create mid-call. "auto" negotiates 2026-07-28 (what Claude Code
+# speaks), where the server cannot, and approval rides InputRequiredResult round trips.
+CLIENT_MODE = "legacy"
+
+
 def call(srv, tool_name, approver=None, **args):
     """Call a tool through a real in-process MCP client. Without an approver the client
     declares no elicitation support, like a client that cannot prompt its user.
@@ -58,7 +64,7 @@ def call(srv, tool_name, approver=None, **args):
 
     async def run():
         kw = {"elicitation_callback": approver} if approver else {}
-        async with Client(srv.mcp, mode="legacy", **kw) as client:
+        async with Client(srv.mcp, mode=CLIENT_MODE, **kw) as client:
             return await client.call_tool(tool_name, args)
 
     res = asyncio.run(run())

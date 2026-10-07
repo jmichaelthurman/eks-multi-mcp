@@ -1,10 +1,20 @@
 """apply_yaml and manage_k8s_resource: gates, human approval, what reaches the API server,
 and response shape."""
 
+import fakes
 import pytest
 from fakes import Approver, FakeDynamic, FakeResource, install_dynamic, make_server, result, tool_error
 
-CM = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm", "namespace": "app"}, "data": {"k": "v"}}
+
+@pytest.fixture(autouse=True, params=["legacy", "auto"])
+def client_mode(request, monkeypatch):
+    """Run every write test over both protocols: elicitation/create mid-call (legacy) and
+    InputRequiredResult round trips (2026-07-28, what Claude Code speaks)."""
+    monkeypatch.setattr(fakes, "CLIENT_MODE", request.param)
+    return request.param
+
+
+CM ={"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm", "namespace": "app"}, "data": {"k": "v"}}
 DELETE_CM = {"operation": "delete", "kind": "ConfigMap", "name": "cm", "namespace": "app"}
 
 

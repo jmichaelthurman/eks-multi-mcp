@@ -52,23 +52,21 @@ class TerminalHuman:
     """Approval prompt answered by the person running the tests, on their terminal."""
 
     def __init__(self):
+        # Separate handles: "r+" wraps the tty in a seekable buffer, and a tty can't seek, so
+        # it raises io.UnsupportedOperation (an OSError) and every write check would skip.
         try:
-            self.tty = open("/dev/tty", "r+")  # noqa: SIM115 - held for the session
+            self.tty_in = open("/dev/tty")  # noqa: SIM115 - held for the session
+            self.tty_out = open("/dev/tty", "w")  # noqa: SIM115
         except OSError:
             pytest.skip("live write checks need a terminal to ask you for approval (run with -s)")
 
     async def __call__(self, context, params):
         import mcp_types as types
 
-        props = params.requested_schema["properties"]
-        self.tty.write("\n" + "=" * 70 + "\n" + params.message + "\n")
-        if "cluster_name" in props:
-            self.tty.write("cluster name> ")
-            self.tty.flush()
-            return types.ElicitResult(action="accept", content={"cluster_name": self.tty.readline().strip()})
-        self.tty.write("approve? [y/N]> ")
-        self.tty.flush()
-        yes = self.tty.readline().strip().lower() in ("y", "yes")
+        self.tty_out.write("\n" + "=" * 70 + "\n" + params.message + "\n")
+        self.tty_out.write("approve? [y/N]> ")
+        self.tty_out.flush()
+        yes = self.tty_in.readline().strip().lower() in ("y", "yes")
         return types.ElicitResult(action="accept" if yes else "decline", content={"approve": True} if yes else None)
 
 

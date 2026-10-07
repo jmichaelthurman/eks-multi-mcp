@@ -1,5 +1,6 @@
 """Read tools against in-memory Kubernetes and AWS doubles."""
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -90,6 +91,28 @@ def test_get_secret_is_redacted_by_default(k8s, kind):
     out = result(k8s.srv, "get_k8s_resource", target="dev", kind=kind, name="s", namespace="ns1", output="json")
     assert out["result"]["data"] == {"password": "<redacted>"}
     assert out["result"]["stringData"] == {"t": "<redacted>"}
+
+
+@pytest.mark.parametrize("output", ["json", "yaml"])
+def test_redacted_secret_returns_an_allowlist_only(files, monkeypatch, output):
+    """The review's repro: kubectl apply leaves the full Secret, values included, in the
+    last-applied-configuration annotation, which blanking data/stringData missed."""
+    last_applied = json.dumps({"apiVersion": "v1", "kind": "Secret", "data": {"password": "aHVudGVyMg=="}})
+    srv = make_server(files)
+    install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("Secret", items=[{
+        "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+        "metadata": {"name": "s", "namespace": "ns1", "labels": {"app": "web"},
+                     "annotations": {"kubectl.kubernetes.io/last-applied-configuration": last_applied,
+                                     "note": "hunter2"},
+                     "ownerReferences": [{"name": "hunter2-owner"}]},
+        "data": {"password": "aHVudGVyMg=="}, "stringData": {"t": "hunter2"}}])))
+    out = result(srv, "get_k8s_resource", target="dev", kind="Secret", name="s", namespace="ns1", output=output)
+    body = out["result"] if output == "json" else yaml.safe_load(out["result"])
+    text = json.dumps(body)
+    assert "aHVudGVyMg" not in text and "hunter2" not in text
+    assert body["metadata"] == {"name": "s", "namespace": "ns1", "labels": {"app": "web"}}
+    assert body["type"] == "Opaque"
+    assert body["data"] == {"password": "<redacted>"} and body["stringData"] == {"t": "<redacted>"}
 
 
 def test_get_secret_unredacted_with_sensitive_access(files, monkeypatch):

@@ -528,17 +528,15 @@ class EksMultiServer:
         @tool
         def get_k8s_resource(target: str, kind: str, name: str, api_version: str = "v1",
                              namespace: str | None = None, output: Literal["yaml", "json"] = "yaml") -> dict:
-            """Get one Kubernetes resource in full (managedFields stripped). Secret values are
-            redacted unless sensitive data access is enabled."""
+            """Get one Kubernetes resource in full (managedFields stripped). Unless sensitive data
+            access is enabled, a Secret is reduced to its name, namespace, labels, type and key names."""
             t = self.target(target)
             res = self._resource(t, api_version, kind)
             obj = (res.get(name=name, namespace=namespace) if res.namespaced else res.get(name=name)).to_dict()
             (obj.get("metadata") or {}).pop("managedFields", None)
             kinds = {kind, res.kind, getattr(res, "base_kind", None)}
             if kinds & SENSITIVE_KINDS and not self.settings.allow_sensitive_data_access:
-                for k in ("data", "stringData"):
-                    if obj.get(k):
-                        obj[k] = {key: "<redacted>" for key in obj[k]}
+                obj = _redacted_secret(obj)
             body = yaml.safe_dump(obj, sort_keys=False) if output == "yaml" else obj
             return self.wrap(t, body)
 
@@ -833,6 +831,21 @@ def _selectors(label_selector: str | None, field_selector: str | None) -> dict:
     if field_selector:
         kw["field_selector"] = field_selector
     return kw
+
+
+def _redacted_secret(obj: dict) -> dict:
+    """A Secret reduced to an allowlist: identity, type, labels and key names. Values can
+    hide anywhere else too (kubectl's last-applied-configuration annotation carries the
+    whole object), so nothing outside the allowlist is returned."""
+    md = obj.get("metadata") or {}
+    out: dict[str, Any] = {k: obj[k] for k in ("apiVersion", "kind") if obj.get(k)}
+    out["metadata"] = {k: md[k] for k in ("name", "namespace", "labels") if md.get(k)}
+    if obj.get("type"):
+        out["type"] = obj["type"]
+    for k in ("data", "stringData"):
+        if obj.get(k):
+            out[k] = {key: "<redacted>" for key in obj[k]}
+    return out
 
 
 def _summarize(o: dict) -> dict:

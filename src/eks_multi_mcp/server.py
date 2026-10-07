@@ -49,8 +49,9 @@ Multi-account, multi-cluster Amazon EKS server.
 - Fleet tools (`fleet_*`) take a selector such as `env:dev`, `account:team-*`,
   `web-*`, or `*`.
 - Reads use each account's read profile; writes use its write profile.
-- Writes to a protected environment (always prd/prod/production) or to a target whose
-  environment is unknown are forbidden; there is no way to approve them.
+- Writes to a protected environment (always prd/prod/production), or to a target whose
+  environment is unknown or only guessed from its name, are forbidden; there is no way
+  to approve them. Writable targets need `env` set in the cluster map.
 - Every other write, dry runs included, pauses for a human to approve it in the MCP
   client. Clients that cannot show that prompt cannot write.
 - Run `doctor` when access fails: it pinpoints expired SSO, stale kube contexts and
@@ -112,6 +113,9 @@ class EksMultiServer:
         if self.is_protected(t):
             raise ToolError(f"writes to '{t.alias}' are forbidden: env '{t.env}' (account {t.account_id}) "
                             "is protected, and this server never writes to protected environments")
+        if not t.env_configured:
+            raise ToolError(f"writes to '{t.alias}' are forbidden: its env '{t.env}' was guessed from its name, "
+                            f"which could be wrong (set env for account {t.account_id} in the cluster map)")
 
     def is_protected(self, t: Target) -> bool:
         protected = {normalize_env(e) for e in self.settings.protected_envs}
@@ -572,7 +576,7 @@ class EksMultiServer:
                        dry_run: bool = False, force_conflicts: bool = False) -> dict:
             """Server-side apply one or more YAML documents, authenticated with the target's
             write profile. Requires --allow-write and a human's approval in the MCP client.
-            Forbidden in protected envs (prd/prod/production) and when the env is unknown."""
+            Forbidden in protected envs (prd/prod/production) and when the env is unknown or guessed."""
             t = self.target(target)
             self.require_write(t)
             try:
@@ -616,7 +620,7 @@ class EksMultiServer:
                                 body: dict | None = None, dry_run: bool = False) -> dict:
             """Create, replace, merge-patch or delete one resource with the target's write profile.
             Requires --allow-write and a human's approval in the MCP client. Forbidden in
-            protected envs (prd/prod/production) and when the env is unknown."""
+            protected envs (prd/prod/production) and when the env is unknown or guessed."""
             t = self.target(target)
             self.require_write(t)
             ns = _namespace(self._resource(t, api_version, kind), namespace, kind)

@@ -27,6 +27,9 @@ safety:
   protected_envs: [uat]               # writes forbidden; prd/prod/production always are
 
 # Per-account defaults. Keys are account IDs (quote them).
+# `env` here (or on a cluster entry) is what makes a cluster writable. Without it the env is
+# guessed from cluster, account and profile names: fine for display and `env:` selectors,
+# but writes to a cluster with a guessed env are refused.
 accounts:
   "111111111111": { name: dev, env: dev }
   "222222222222": { name: stg, env: stg }

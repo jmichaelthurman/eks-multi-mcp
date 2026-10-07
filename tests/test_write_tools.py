@@ -18,9 +18,13 @@ CM ={"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm", "namesp
 DELETE_CM = {"operation": "delete", "kind": "ConfigMap", "name": "cm", "namespace": "app"}
 
 
+# Writes need an env from the cluster map, not one guessed from names.
+DEV_ACCOUNT = {"111111111111": {"env": "dev"}}
+
+
 @pytest.fixture
 def writable(files, monkeypatch):
-    srv = make_server(files, safety={"allow_write": True})
+    srv = make_server(files, safety={"allow_write": True}, accounts=DEV_ACCOUNT)
     cm = FakeResource("ConfigMap")
     ns = FakeResource("Namespace", namespaced=False)
     dyn = FakeDynamic(cm, ns)
@@ -212,6 +216,48 @@ def test_unknown_env_writable_once_env_is_set(files, monkeypatch):
     install_dynamic(monkeypatch, srv, FakeDynamic(cm))
     result(srv, "manage_k8s_resource", Approver(), target="ops-main", **DELETE_CM)
     assert cm.calls[0][0] == "delete"
+
+
+@pytest.mark.parametrize("target,clusters", [
+    # A prod-account cluster whose name merely looks like dev (the review's repro).
+    ("dev-portal", [{"cluster_name": "dev-portal", "region": "us-east-1", "account_id": "333333333333"}]),
+    # The kubeconfig-only dev target: its env is guessed from names, never configured.
+    ("dev", []),
+])
+def test_guessed_env_is_not_writable(files, monkeypatch, target, clusters):
+    """An env guessed from cluster, account or profile names is fine for display and
+    selectors, but it is not evidence that a cluster is safe to write to."""
+    srv = make_server(files, safety={"allow_write": True}, clusters=clusters)
+    t = srv.registry.resolve(target)
+    assert t.env == "dev" and not t.env_configured
+    modes = install_dynamic(monkeypatch, srv, FakeDynamic(FakeResource("ConfigMap")))
+    human = Approver()
+    msg = tool_error(srv, "manage_k8s_resource", human, target=target, **DELETE_CM)
+    assert "guessed from its name" in msg and "set env" in msg
+    assert modes == [] and human.prompts == []
+
+
+@pytest.mark.parametrize("config", [
+    {"accounts": {"333333333333": {"env": "dev"}}},
+    {"clusters": [{"cluster_name": "dev-portal", "region": "us-east-1", "account_id": "333333333333",
+                   "env": "dev"}]},
+])
+def test_configured_env_is_writable(files, monkeypatch, config):
+    clusters = config.get("clusters") or [{"cluster_name": "dev-portal", "region": "us-east-1",
+                                           "account_id": "333333333333"}]
+    srv = make_server(files, safety={"allow_write": True}, clusters=clusters,
+                      **({"accounts": config["accounts"]} if "accounts" in config else {}))
+    assert srv.registry.resolve("dev-portal").env_configured
+    cm = FakeResource("ConfigMap")
+    install_dynamic(monkeypatch, srv, FakeDynamic(cm))
+    result(srv, "manage_k8s_resource", Approver(), target="dev-portal", **DELETE_CM)
+    assert cm.calls[0][0] == "delete"
+
+
+def test_guessed_prod_is_still_protected(files):
+    """Inference still counts toward protection: a name that looks like prod is refused."""
+    srv = make_server(files, safety={"allow_write": True})
+    assert "is protected" in tool_error(srv, "manage_k8s_resource", Approver(), target="prod-blue", **DELETE_CM)
 
 
 def test_account_read_only_beats_allow_write(files, monkeypatch):

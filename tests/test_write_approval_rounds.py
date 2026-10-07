@@ -20,7 +20,7 @@ APPROVED = {"approve": types.ElicitResult(action="accept", content={"approve": T
 
 @pytest.fixture
 def writable(files, monkeypatch):
-    srv = make_server(files, safety={"allow_write": True})
+    srv = make_server(files, safety={"allow_write": True}, accounts={"111111111111": {"env": "dev"}})
     cm = FakeResource("ConfigMap")
     modes = install_dynamic(monkeypatch, srv, FakeDynamic(cm, FakeResource("Namespace", namespaced=False)))
     return srv, cm, modes

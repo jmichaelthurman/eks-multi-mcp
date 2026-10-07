@@ -42,6 +42,9 @@ class Target:
     alias: str
     aliases: set[str] = field(default_factory=set)
     env: str | None = None
+    # True only when env came from the cluster map (cluster or account entry). A guessed env
+    # is fine for display and selectors, but never makes a target writable.
+    env_configured: bool = False
     account_name: str | None = None
     read_profile: str | None = None
     write_profile: str | None = None
@@ -150,6 +153,7 @@ class Registry:
             account_id=account_id,
             alias=c.alias or c.cluster_name,
             env=c.env,
+            env_configured=bool(c.env),
             read_profile=c.read_profile,
             write_profile=c.write_profile,
             role_arn=c.role_arn,
@@ -253,7 +257,8 @@ class Registry:
             if acct:
                 t.account_name = t.account_name or acct.name
                 t.read_only = t.read_only or acct.read_only
-                t.env = t.env or acct.env
+                if not t.env and acct.env:
+                    t.env, t.env_configured = acct.env, True
             if not t.account_name and candidates:
                 t.account_name = min((p.name for p in candidates), key=lambda n: (len(n), n))
             t.env = (t.env or infer_env(t.cluster_name, t.account_name, t.read_profile) or "").lower() or None
